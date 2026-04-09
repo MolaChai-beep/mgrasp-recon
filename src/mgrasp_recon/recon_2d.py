@@ -1,307 +1,184 @@
+"""2D subspace reconstruction orchestration internals used by workflow classes."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+
 import numpy as np
-
-import torch
-
-import pathlib
-import sys
-
-from ._bootstrap import ensure_repo_paths
-
-# clear sigpy
-for k in list(sys.modules.keys()):
-    if k == 'sigpy' or k.startswith('sigpy.'):
-        del sys.modules[k]
-
-REPO_ROOT, SRC_ROOT = ensure_repo_paths()
-
-from mgrasp_recon.recon_utils import (
-    apply_dcf,
-    estimate_pca_basis,
-    get_coil,
-    get_traj,
-    load_basis_option_from_h5,
-    ramp_dcf_from_traj,
-    save_pca_basis_h5,
-    save_slice_h5,
-    load_slice_kspace_for_coil,
-    ri_to_coil_spokes_samples,
-)
-from mgrasp_recon.interframe_recon import radial_lowres_pca_recon_2d
-
 import sigpy as sp
+import torch
 from sigpy.mri.app import HighDimensionalRecon
 
-import scipy as scp
-# print("scipy.__file__ =", scp.__file__)
-# print("scipy.__version__ =", scp.__version__)
+from .config import Recon2DResult, ReconstructionConfig, SliceReconResult, SliceReconstructionConfig
+from .recon_utils import _estimate_coil_maps, load_basis_option_from_h5, load_slice_kspace_for_coil, ramp_dcf_from_traj, ri_to_coil_spokes_samples, save_slice_h5
 
-from scipy.ndimage import gaussian_filter, binary_fill_holes, binary_opening, binary_closing, binary_erosion
-from scipy import ndimage as ndi
-
-import argparse
-import h5py
-import os
-
-import numpy as np
-import csv
-
-import re
-import glob
-import matplotlib.pyplot as plt
-import torch
-import cupy as cp
+LOGGER = logging.getLogger(__name__)
 
 
-def run_subspace_recon_2d(
+def _log(verbose: bool, message: str, *args) -> None:
+    if verbose:
+        LOGGER.info(message, *args)
+
+
+def _default_device(device):
+    if device is not None:
+        return device
+    return sp.Device(0 if torch.cuda.is_available() else -1)
+
+
+def _prepare_mps_for_highdim(mps: np.ndarray) -> np.ndarray:
+    mps = np.asarray(mps, dtype=np.complex64)
+    if mps.ndim == 4 and mps.shape[0] == 1:
+        return np.transpose(mps, (1, 0, 2, 3))
+    if mps.ndim == 4 and mps.shape[1] == 1:
+        return mps
+    raise ValueError(f"mps must have shape (1, Nc, Ny, Nx) or (Nc, 1, Ny, Nx), got {mps.shape}")
+
+
+def _run_subspace_recon_2d(
     ksp,
     traj,
     mps,
     fbasis_path,
     spokes_per_frame,
-    nbasis=5,
-    cbasis=False,
-    add_constant=True,
-    lamda=1e-3,
-    regu="TV",
-    regu_axes=[-2, -1],
-    max_iter=10,
-    solver="ADMM",
-    use_dcf=True,
+    config: ReconstructionConfig | None = None,
     device=None,
-    show_pbar=False,
-):
-    """
-    2D PCA/subspace reconstruction following the 3D reference code logic.
-
-    Parameters
-    ----------
-    ksp : ndarray
-        Complex k-space, shape (Nc, Nspokes_total, Ns)
-    traj : ndarray
-        Trajectory, shape (T, spf, Ns, 2)
-    mps : ndarray
-        Coil sensitivity maps, shape (1, Nc, Ny, Nx) or (Nc, 1, Ny, Nx)
-    fbasis_path : str
-        Path to saved PCA basis H5 file.
-    spokes_per_frame : int
-        Number of spokes per frame.
-    nbasis : int
-        Number of PCA basis vectors to load.
-    cbasis : bool
-        Whether to build complex basisoption like reference code.
-    add_constant : bool
-        Whether to append a constant basis.
-    lamda : float
-        Regularization weight.
-    regu : str
-        'TIK', 'TV', 'LLR', etc.
-    regu_axes : list
-        Regularization axes for HighDimensionalRecon.
-    max_iter : int
-        Iteration count.
-    solver : str
-        e.g. 'ADMM'
-    use_dcf : bool
-        Whether to use radial DCF weights.
-    """
-
-    if device is None:
-        device = sp.Device(0 if torch.cuda.is_available() else -1)
+) -> Recon2DResult:
+    config = config or ReconstructionConfig()
+    device = _default_device(device)
 
     ksp = np.asarray(ksp, dtype=np.complex64)
     traj = np.asarray(traj, dtype=np.float32)
 
     if ksp.ndim != 3:
         raise ValueError(f"ksp must have shape (Nc, Nspokes_total, Ns), got {ksp.shape}")
-
     if traj.ndim != 4:
         raise ValueError(f"traj must have shape (T, spf, Ns, 2), got {traj.shape}")
 
-    Nc, Nspokes_total, Ns = ksp.shape
-    T = Nspokes_total // spokes_per_frame
-    Nspokes_used = T * spokes_per_frame
-
-    if traj.shape[0] != T or traj.shape[1] != spokes_per_frame or traj.shape[2] != Ns:
+    num_coils, nspokes_total, num_samples = ksp.shape
+    num_frames = nspokes_total // spokes_per_frame
+    nspokes_used = num_frames * spokes_per_frame
+    if traj.shape[0] != num_frames or traj.shape[1] != spokes_per_frame or traj.shape[2] != num_samples:
         raise ValueError(
-            f"traj shape {traj.shape} is inconsistent with derived "
-            f"(T, spf, Ns)=({T}, {spokes_per_frame}, {Ns})"
+            f"traj shape {traj.shape} is inconsistent with derived (T, spf, Ns)=({num_frames}, {spokes_per_frame}, {num_samples})"
         )
 
-    # Load basisoption exactly for step 2.
     basisoption = load_basis_option_from_h5(
         fbasis_path,
-        nbasis=nbasis,
-        cbasis=cbasis,
-        add_constant=add_constant,
+        nbasis=config.nbasis,
+        cbasis=config.cbasis,
+        add_constant=config.add_constant,
     )
-
-    # The reference app expects basis.shape[0] == Ntime * Necho.
-    # Here Necho = 1, so basisoption.shape[0] must equal T.
-    if basisoption.shape[0] != T:
+    if basisoption.shape[0] != num_frames:
         raise ValueError(
-            f"basisoption has {basisoption.shape[0]} time points, but recon uses T={T} frames."
+            f"basisoption has {basisoption.shape[0]} time points, but recon uses T={num_frames} frames."
         )
 
-    # Prepare mps to shape (Nc, 1, Ny, Nx) for 2D HighDimensionalRecon.
-    mps = np.asarray(mps, dtype=np.complex64)
-    if mps.ndim == 4 and mps.shape[0] == 1:
-        mps = np.transpose(mps, (1, 0, 2, 3))  # (1, Nc, Ny, Nx) -> (Nc, 1, Ny, Nx)
-    elif mps.ndim == 4 and mps.shape[1] == 1:
-        pass  # already (Nc, 1, Ny, Nx)
-    else:
-        raise ValueError(
-            f"mps must have shape (1, Nc, Ny, Nx) or (Nc, 1, Ny, Nx), got {mps.shape}"
-        )
+    mps = _prepare_mps_for_highdim(mps)
+    ksp_use = ksp[:, :nspokes_used, :]
+    ksp_prep = np.swapaxes(ksp_use, 0, 1)
+    ksp_prep = ksp_prep.reshape(num_frames, spokes_per_frame, num_coils, num_samples)
+    ksp_prep = np.transpose(ksp_prep, (0, 2, 1, 3))
+    ksp_prep = ksp_prep[:, None, :, None, :, :]
 
-    # Trim and frame the k-space like the 3D reference script.
-    ksp_use = ksp[:, :Nspokes_used, :]                       # (Nc, T*spf, Ns)
-    ksp_prep = np.swapaxes(ksp_use, 0, 1)                   # (T*spf, Nc, Ns)
-    ksp_prep = ksp_prep.reshape(T, spokes_per_frame, Nc, Ns)
-    ksp_prep = np.transpose(ksp_prep, (0, 2, 1, 3))         # (T, Nc, spf, Ns)
-    ksp_prep = ksp_prep[:, None, :, None, :, :]             # (T, 1, Nc, 1, spf, Ns)
-
-    # coord for 2D HighDimensionalRecon: (T, spf, Ns, 2)
-    coord_prep = traj
-
-    # weights shaped like ksp_prep, similar to the reference code.
-    if use_dcf:
-        dcf = np.sqrt(coord_prep[..., 0] ** 2 + coord_prep[..., 1] ** 2).astype(np.float32)
-        weights = dcf[:, None, None, None, :, :]            # (T, 1, 1, 1, spf, Ns)
-        weights = np.tile(weights, (1, 1, Nc, 1, 1, 1))     # (T, 1, Nc, 1, spf, Ns)
+    if config.use_dcf:
+        dcf = ramp_dcf_from_traj(traj, normalize=False).reshape(num_frames, spokes_per_frame, num_samples)
+        weights = dcf[:, None, None, None, :, :]
+        weights = np.tile(weights, (1, 1, num_coils, 1, 1, 1)).astype(np.float32, copy=False)
     else:
         weights = np.ones_like(ksp_prep, dtype=np.float32)
 
-    print("ksp_prep shape:", ksp_prep.shape)
-    print("coord_prep shape:", coord_prep.shape)
-    print("weights shape:", weights.shape)
-    print("mps shape:", mps.shape)
-    print("basisoption shape:", basisoption.shape)
+    _log(config.verbose, "subspace recon ksp=%s mps=%s basis=%s", ksp_prep.shape, mps.shape, basisoption.shape)
 
-    # Run 2D subspace reconstruction.
     recon = HighDimensionalRecon(
         ksp_prep,
         mps,
         weights=weights,
-        coord=coord_prep,
+        coord=traj,
         basis=basisoption,
-        lamda=lamda,
-        regu=regu,
-        regu_axes=regu_axes,
-        max_iter=max_iter,
-        solver=solver,
+        lamda=config.lamda,
+        regu=config.regu,
+        regu_axes=config.regu_axes,
+        max_iter=config.max_iter,
+        solver=config.solver,
         device=device,
-        show_pbar=show_pbar,
+        show_pbar=config.show_pbar,
     ).run()
 
-    recon = sp.to_device(recon, sp.cpu_device)
-    recon = np.asarray(recon)
-
-    print("raw recon output shape:", recon.shape)
-
-    # Remove singleton dims. Expected result is roughly (Nbasis_eff, Ny, Nx).
+    recon = np.asarray(sp.to_device(recon, sp.cpu_device))
     coeff_maps = np.squeeze(recon)
-
     if coeff_maps.ndim != 3:
-        raise ValueError(
-            f"Expected coefficient maps to be 3D after squeeze, got {coeff_maps.shape}"
-        )
-
-    # coeff_maps: (Keff, Ny, Nx)
-    # basisoption: (T, Keff)
+        raise ValueError(f"Expected coefficient maps to be 3D after squeeze, got {coeff_maps.shape}")
     if coeff_maps.shape[0] != basisoption.shape[1]:
         raise ValueError(
-            f"Coefficient count mismatch: coeff_maps.shape[0]={coeff_maps.shape[0]} "
-            f"but basisoption.shape[1]={basisoption.shape[1]}"
+            f"Coefficient count mismatch: coeff_maps.shape[0]={coeff_maps.shape[0]} but basisoption.shape[1]={basisoption.shape[1]}"
         )
 
-    # Recover dynamic series: x(t, y, x) = sum_k basis(t, k) * coeff(k, y, x)
     img_dyn = np.einsum("tk,kyx->tyx", basisoption, coeff_maps)
-    img_dyn_abs = np.abs(img_dyn)
-
-    return coeff_maps, img_dyn, img_dyn_abs, basisoption
+    return Recon2DResult(coeff_maps=coeff_maps, img_dyn=img_dyn, img_dyn_abs=np.abs(img_dyn), basisoption=basisoption)
 
 
-
-
-def run_subspace_recon_for_slice(
+def _run_subspace_recon_for_slice(
     slice_file,
     traj,
     fbasis_path,
     spokes_per_frame,
-    hop_id=None,
-    slice_idx=None,
-    nbasis=5,
-    cbasis=False,
-    add_constant=True,
-    lamda=1e-3,
-    regu="TV",
-    regu_axes=[-2, -1],
-    max_iter=10,
-    solver="ADMM",
-    use_dcf=True,
-    coil_thresh=0.02,
-    coil_device=-1,
-    recon_device=None,
-    show_pbar=False,
-    save_h5=False,
-    out_path=None,
-):
-    """Run the full step-2 subspace recon pipeline for a single slice file."""
+    config: SliceReconstructionConfig | None = None,
+    coil_thresh=None,
+) -> SliceReconResult:
+    config = config or SliceReconstructionConfig()
+    slice_idx = config.slice_idx
+    hop_id = config.hop_id or ""
+
     if slice_idx is None:
-        m = re.search(r"slice(\d+)\.h5$", os.path.basename(slice_file))
-        if m is not None:
-            slice_idx = int(m.group(1)) - 1
+        match = re.search(r"slice(\d+)\.h5$", os.path.basename(slice_file))
+        if match is not None:
+            slice_idx = int(match.group(1)) - 1
 
-    print(f"Loading slice file: {slice_file}")
-    ksp_ri = load_slice_kspace_for_coil(slice_file)
-    print("ksp_coil shape:", ksp_ri.shape)
+    ksp_ri = load_slice_kspace_for_coil(slice_file, verbose=config.recon.verbose)
     ksp_c_for_coil = ri_to_coil_spokes_samples(ksp_ri)
-    print("  k1 shape:", ksp_c_for_coil.shape)
 
-    mps = get_coil(ksp_c_for_coil, device=coil_device, thresh=coil_thresh)
-    print('  mps shape:', np.asarray(sp.to_device(mps, sp.cpu_device)).shape)
+    coil_config = config.coil if coil_thresh is None else type(config.coil)(
+        thresh=coil_thresh,
+        use_dcf=config.coil.use_dcf,
+        mask_floor=config.coil.mask_floor,
+        calib_width=config.coil.calib_width,
+        crop=config.coil.crop,
+        use_espirit=config.coil.use_espirit,
+        verbose=config.coil.verbose or config.recon.verbose,
+    )
+    mps = _estimate_coil_maps(ksp_c_for_coil, device=config.coil_device, config=coil_config)
 
-    coeff_maps, img_dyn_cplx, img_dyn_abs, basisoption = run_subspace_recon_2d(
+    recon = _run_subspace_recon_2d(
         ksp=ksp_c_for_coil,
         traj=traj,
         mps=mps,
         fbasis_path=fbasis_path,
         spokes_per_frame=spokes_per_frame,
-        nbasis=nbasis,
-        cbasis=cbasis,
-        add_constant=add_constant,
-        lamda=lamda,
-        regu=regu,
-        regu_axes=regu_axes,
-        max_iter=max_iter,
-        solver=solver,
-        use_dcf=use_dcf,
-        device=recon_device,
-        show_pbar=show_pbar,
+        config=config.recon,
+        device=config.recon_device,
     )
 
-    if save_h5:
-        if out_path is None:
+    if config.save_h5:
+        if config.out_path is None:
             raise ValueError("out_path must be provided when save_h5=True")
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
         save_slice_h5(
-            out_path=out_path,
-            acq_slice=np.asarray(img_dyn_cplx),
-            hop_id=hop_id if hop_id is not None else "",
+            out_path=config.out_path,
+            acq_slice=np.asarray(recon.img_dyn),
+            hop_id=hop_id,
             spokes_per_frame=spokes_per_frame,
-            N_time=img_dyn_cplx.shape[0],
+            N_time=recon.img_dyn.shape[0],
             slice_idx=-1 if slice_idx is None else slice_idx,
-            smax=np.max(img_dyn_abs),
+            smax=np.max(recon.img_dyn_abs),
         )
-        print(f"Saved slice recon to: {out_path}")
 
-    return {
-        "coeff_maps": coeff_maps,
-        "img_dyn_cplx": img_dyn_cplx,
-        "img_dyn_abs": img_dyn_abs,
-        "basisoption": basisoption,
-        "mps": np.asarray(sp.to_device(mps, sp.cpu_device)),
-        "ksp": ksp_c_for_coil,
-    }
+    return SliceReconResult(
+        coeff_maps=recon.coeff_maps,
+        img_dyn_cplx=recon.img_dyn,
+        img_dyn_abs=recon.img_dyn_abs,
+        basisoption=recon.basisoption,
+        mps=np.asarray(sp.to_device(mps, sp.cpu_device)),
+        ksp=ksp_c_for_coil,
+    )
