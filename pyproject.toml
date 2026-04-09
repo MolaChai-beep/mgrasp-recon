@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mgrasp-recon-code"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cupy-cuda12x",
+    "h5py",
+    "matplotlib",
+    "numba",
+    "numpy",
+    "pywavelets",
+    "scipy",
+    "sigpy",
+    "torch",
+    "tqdm",
+]
+
+[tool.uv.sources]
+sigpy = { git = "https://github.com/MolaChai-beep/sigpy.git", rev = "d4132654b409d27524322844879a52f41c486e00" }
+torch = { index = "pytorch-cu121" }
+
+[tool.uv.extra-build-dependencies]
+sigpy = ["numpy", "torch"]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
