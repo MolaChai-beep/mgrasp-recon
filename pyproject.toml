@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "cupy-cuda12x",
     "h5py",
+    "ipykernel>=7.2.0",
     "matplotlib",
     "numba",
     "numpy",
