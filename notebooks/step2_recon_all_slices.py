@@ -40,7 +40,7 @@ BASIS_CONFIGS = [
 ]
 LAMBDA_VALUES = [1e-3]
 SAVE_DIR = REPO_ROOT / "lambda_test_outputs"
-START_SLICE_IDX = 49
+START_SLICE_IDX = 49 # skip already-processed slices from previous runs (set to 0 to start from the beginning)
 
 
 def lambda_to_output_label(lambda_value: float) -> str:
@@ -144,7 +144,6 @@ def main() -> int:
             raise FileNotFoundError(f"Directory not found: {hop_dir}")
 
         slice_files = list_slice_files(hop_dir)
-        slice_files = slice_files[49:]
         print(f"> Found {len(slice_files)} slice files in {hop_dir}")
 
         n_coils, n_samples, n_spokes, n_slices = infer_kspace_dims(slice_files[0])
@@ -176,7 +175,7 @@ def main() -> int:
 
                 print(f"    lambda = {lambda_label}")
                 print(f"    patient output dir: {patient_output_dir}")
-                
+
                 if START_SLICE_IDX < 0 or START_SLICE_IDX >= len(slice_files):
                                     raise ValueError(
                                         f"START_SLICE_IDX={START_SLICE_IDX} is outside the available slice range "
