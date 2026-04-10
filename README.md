@@ -20,3 +20,18 @@ Academic code repository for dynamic MRI reconstruction and vascular segmentatio
 - The default environment installs `sigpy` from the fork pinned in `pyproject.toml`.
 - If you need to develop `sigpy` itself, work in a separate checkout and install it editable in your local environment.
 - Raw input data is not stored in this repository.
+
+## Usage
+
+- To run subject on server with nohup (standard output (print statements) and standard error messages will be redirected to a file named nohup.out)
+
+    ```bash
+    nohup ./.venv/bin/python ./notebooks/step2_recon_all_slices.py
+    ```
+
+- to stop the nohup process, first check the PID, then kill
+    
+    ```bash
+    ps aux | grep step2_recon_all_slices.py
+    kill <PID>
+    ```

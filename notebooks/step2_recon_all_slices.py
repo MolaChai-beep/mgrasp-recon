@@ -40,6 +40,7 @@ BASIS_CONFIGS = [
 ]
 LAMBDA_VALUES = [1e-3]
 SAVE_DIR = REPO_ROOT / "lambda_test_outputs"
+START_SLICE_IDX = 49
 
 
 def lambda_to_output_label(lambda_value: float) -> str:
@@ -143,6 +144,7 @@ def main() -> int:
             raise FileNotFoundError(f"Directory not found: {hop_dir}")
 
         slice_files = list_slice_files(hop_dir)
+        slice_files = slice_files[49:]
         print(f"> Found {len(slice_files)} slice files in {hop_dir}")
 
         n_coils, n_samples, n_spokes, n_slices = infer_kspace_dims(slice_files[0])
@@ -174,8 +176,17 @@ def main() -> int:
 
                 print(f"    lambda = {lambda_label}")
                 print(f"    patient output dir: {patient_output_dir}")
+                
+                if START_SLICE_IDX < 0 or START_SLICE_IDX >= len(slice_files):
+                                    raise ValueError(
+                                        f"START_SLICE_IDX={START_SLICE_IDX} is outside the available slice range "
+                                        f"0..{len(slice_files) - 1}"
+                                    )
 
-                for slice_idx, slice_file in enumerate(slice_files):
+                print(f"    starting from slice index: {START_SLICE_IDX:03d}")
+                print(f"    skipping {START_SLICE_IDX} already-processed slice(s)")
+
+                for slice_idx, slice_file in enumerate(slice_files[START_SLICE_IDX:], start=START_SLICE_IDX):
                     print()
                     print(f">>> slice {slice_idx:03d} | {os.path.basename(slice_file)}")
                     try:
