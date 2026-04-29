@@ -37,8 +37,9 @@ from mgrasp_recon.recon_utils import read_csv_config  # noqa: E402
 # Step 3 notebook defaults.
 SUBJECT_ID = "Gross_MeyerA"
 CSV_PATH = "/home/naiqianluan/DCE-MRI/data/DCE_data/20250827-110742-Gross_MeyerA/RAVE_files/config_subject.csv"
-PAR_JSON_ROOT = "/home/naiqianluan/DCE-MRI/data/DCE_data/20250827-110742-Gross_MeyerA/RAVE_files/h5slices_wt_acqT/"
-TEMPLATE_DCM_PATH = "/home/naiqianluan/DCE-MRI/data/DCE_data/20250827-110742-Gross_MeyerA/example_template.dcm"
+SOURCE_H5_ROOT = "/home/naiqianluan/DCE-MRI/data/DCE_data/20250827-110742-Gross_MeyerA/RAVE_files/h5slices_wt_acqT/"
+DICOM_DATA_ROOT = "/home/naiqianluan/DCE-MRI/data/DCE_data/20250827-110742-Gross_MeyerA"
+TEMPLATE_DCM_RELATIVE_PATH = "s000044/Gross_MeyerA_20250827_S000044I00001.DCM"
 BASIS_CONFIGS = [
     ("basis8", 8),
 ]
@@ -61,6 +62,28 @@ def load_par_json(par_json_path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object in {par_json_path}")
     return payload
+
+
+def list_source_slice_files(hop_dir: str | Path) -> list[str]:
+    root = Path(hop_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Source hop directory not found: {root}")
+
+    files = list(root.glob("slice*.h5"))
+    if not files:
+        raise FileNotFoundError(f"No source slice files found in {root}")
+
+    def sort_key(path: Path) -> int:
+        match = re.search(r"slice(\d+)\.h5$", path.name)
+        if match is None:
+            raise ValueError(f"Unexpected source slice filename: {path.name}")
+        return int(match.group(1))
+
+    return [str(path) for path in sorted(files, key=sort_key)]
+
+
+def get_template_dcm_path() -> str:
+    return os.path.join(DICOM_DATA_ROOT, TEMPLATE_DCM_RELATIVE_PATH)
 
 
 def list_reconstructed_slice_files(recon_input_dir: str | Path, hop_id: str) -> list[str]:
@@ -162,9 +185,9 @@ def apply_par_to_dataset(ds, par: dict[str, Any], te_ms: float | None = None, th
     return ds
 
 
-def compute_slice_geometry(ds, slice_idx: int, n_slices: int) -> tuple[float, list[float]]:
+def compute_slice_geometry(ds, slice_idx: int, total_source_slices: int) -> tuple[float, list[float]]:
     slice_spacing_mm = float(ds.SpacingBetweenSlices)
-    z0 = -(n_slices // 2) * slice_spacing_mm
+    z0 = -(total_source_slices // 2) * slice_spacing_mm
     slice_loc = z0 + slice_idx * slice_spacing_mm
 
     if not hasattr(ds, "FOV"):
@@ -183,7 +206,7 @@ def prepare_output_dataset(
     hop_id: str,
     slice_idx: int,
     frame_idx: int,
-    n_slices: int,
+    total_source_slices: int,
     spokes_per_frame: int,
     pixel_array: np.ndarray,
     start_dt: datetime,
@@ -192,7 +215,11 @@ def prepare_output_dataset(
 
     frame_delay = timedelta(minutes=frame_idx * MINUTES_PER_288_SPOKES * spokes_per_frame / 288.0)
     dt_delay = start_dt + frame_delay
-    slice_loc, image_position = compute_slice_geometry(ds, slice_idx=slice_idx, n_slices=n_slices)
+    slice_loc, image_position = compute_slice_geometry(
+        ds,
+        slice_idx=slice_idx,
+        total_source_slices=total_source_slices,
+    )
 
     ds.ContentDate = start_dt.strftime("%Y%m%d")
     ds.ContentTime = dt_delay.strftime("%H%M%S.%f")
@@ -215,8 +242,8 @@ def prepare_output_dataset(
     ds[0x00100020].value = hop_id
     ds[0x00201041].value = float(slice_loc)
     ds[0x00200010].value = "1"
-    ds[0x00080018].value = str(frame_idx * n_slices + (slice_idx + 1))
-    ds.InstanceNumber = int(frame_idx * n_slices + (slice_idx + 1))
+    ds[0x00080018].value = str(frame_idx * total_source_slices + (slice_idx + 1))
+    ds.InstanceNumber = int(frame_idx * total_source_slices + (slice_idx + 1))
     return ds
 
 
@@ -227,7 +254,7 @@ def export_slice_series(
     template_ds,
     par: dict[str, Any],
     global_max: float,
-    n_slices: int,
+    total_source_slices: int,
     output_dir: Path,
     target_max: int = TARGET_MAX,
     dataset_name: str = DATASET_NAME,
@@ -251,7 +278,7 @@ def export_slice_series(
             hop_id=hop_id,
             slice_idx=slice_idx,
             frame_idx=frame_idx,
-            n_slices=n_slices,
+            total_source_slices=total_source_slices,
             spokes_per_frame=spokes_per_frame,
             pixel_array=scaled_series[frame_idx],
             start_dt=start_dt,
@@ -288,7 +315,8 @@ def main() -> int:
             for config in configs:
                 hop_id = config["hop_id"]
                 spokes_per_frame = config["spokes_per_frame"]
-                par_json_path = os.path.join(PAR_JSON_ROOT, hop_id, "par.json")
+                source_hop_dir = os.path.join(SOURCE_H5_ROOT, hop_id)
+                par_json_path = os.path.join(source_hop_dir, "par.json")
                 output_dir = dicom_output_base / hop_id
 
                 print()
@@ -301,12 +329,20 @@ def main() -> int:
                     if sorted(slice_indices) != slice_indices:
                         raise ValueError(f"Slice file ordering is not monotonic for {hop_id}: {slice_indices}")
 
+                    source_slice_files = list_source_slice_files(source_hop_dir)
+                    total_source_slices = len(source_slice_files)
+                    template_dcm_path = get_template_dcm_path()
+                    if not os.path.exists(template_dcm_path):
+                        raise FileNotFoundError(f"Template DICOM not found: {template_dcm_path}")
+
                     par = load_par_json(par_json_path)
-                    template_ds = pydicom.dcmread(TEMPLATE_DCM_PATH)
+                    template_ds = pydicom.dcmread(template_dcm_path)
                     output_dir.mkdir(parents=True, exist_ok=True)
 
                     global_max = compute_global_max(slice_files)
                     print(f"    global_max: {global_max:.4f}")
+                    print(f"    total_source_slices: {total_source_slices}")
+                    print(f"    template dcm: {template_dcm_path}")
                     print(f"    output dir: {output_dir}")
 
                     written_files = 0
@@ -318,7 +354,7 @@ def main() -> int:
                             template_ds=template_ds,
                             par=par,
                             global_max=global_max,
-                            n_slices=len(slice_files),
+                            total_source_slices=total_source_slices,
                             output_dir=output_dir,
                         )
 
