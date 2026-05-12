@@ -8,3 +8,5 @@ __pycache__/
 *.egg-info/
 sigpy/
 **/*.h5
+outputs/
+dicom_exports/basis8/dicom_lambda_1em03/Gross_MeyerA/DCE/
