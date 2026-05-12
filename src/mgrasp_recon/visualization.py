@@ -7,32 +7,47 @@ import numpy as np
 
 
 def plot_time_intensity_curves(
-    vessel_curve: np.ndarray,
-    vessel_coord: tuple[int, int],
+    vessel_curve: np.ndarray | None = None,
+    vessel_coord: tuple[int, int] | None = None,
     tissue_curves: list[np.ndarray] | None = None,
     tissue_coords: list[tuple[int, int]] | None = None,
+    named_curves: list[tuple[str, np.ndarray, dict[str, object]]] | None = None,
     frame_time_sec: float | None = None,
     normalize: bool = False,
     title: str = "Time-intensity curves",
 ):
     tissue_curves = tissue_curves or []
     tissue_coords = tissue_coords or []
+    named_curves = named_curves or []
+
+    if vessel_curve is None and not named_curves:
+        raise ValueError("Provide vessel_curve or named_curves.")
+
+    if vessel_curve is not None:
+        num_points = len(vessel_curve)
+    else:
+        num_points = len(named_curves[0][1])
 
     if frame_time_sec is None:
-        x = np.arange(len(vessel_curve))
+        x = np.arange(num_points)
         xlabel = "Frame"
     else:
-        x = np.arange(len(vessel_curve)) * float(frame_time_sec)
+        x = np.arange(num_points) * float(frame_time_sec)
         xlabel = "Time (s)"
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(
-        x,
-        vessel_curve,
-        linewidth=2.5,
-        color="crimson",
-        label=f"Top vessel voxel {tuple(map(int, vessel_coord))}",
-    )
+
+    if vessel_curve is not None:
+        label = "Vessel"
+        if vessel_coord is not None:
+            label = f"Top vessel voxel {tuple(map(int, vessel_coord))}"
+        ax.plot(
+            x,
+            vessel_curve,
+            linewidth=2.5,
+            color="crimson",
+            label=label,
+        )
 
     for i, (curve, coord) in enumerate(zip(tissue_curves, tissue_coords), start=1):
         ax.plot(
@@ -42,6 +57,9 @@ def plot_time_intensity_curves(
             linestyle="--",
             label=f"Tissue {i} {tuple(map(int, coord))}",
         )
+
+    for label, curve, style in named_curves:
+        ax.plot(x, curve, label=label, **style)
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -54,7 +72,7 @@ def plot_time_intensity_curves(
 
 def show_selected_voxels(
     background_img: np.ndarray,
-    vessel_coord: tuple[int, int],
+    vessel_coord: tuple[int, int] | None = None,
     tissue_coords: list[tuple[int, int]] | None = None,
     vascular_mask: np.ndarray | None = None,
     tissue_mask: np.ndarray | None = None,
@@ -80,8 +98,9 @@ def show_selected_voxels(
             linewidths=0.8,
         )
 
-    vr, vc = map(int, vessel_coord)
-    ax.scatter([vc], [vr], c="crimson", s=70, marker="o", label="Top vessel voxel")
+    if vessel_coord is not None:
+        vr, vc = map(int, vessel_coord)
+        ax.scatter([vc], [vr], c="crimson", s=70, marker="o", label="Top vessel voxel")
 
     if tissue_coords:
         tc = np.asarray([(int(r), int(c)) for r, c in tissue_coords])
@@ -90,6 +109,60 @@ def show_selected_voxels(
     ax.set_title(title)
     ax.axis("off")
     ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_basis_curves(
+    basis: np.ndarray,
+    title: str = "Basis curves",
+    labels: list[str] | None = None,
+):
+    basis = np.asarray(basis)
+    if basis.ndim != 2:
+        raise ValueError(f"basis must be 2D, got {basis.shape}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(basis.shape[0])
+    for idx in range(basis.shape[1]):
+        label = labels[idx] if labels and idx < len(labels) else f"PC{idx + 1}"
+        ax.plot(x, basis[:, idx], linewidth=2.0, label=label)
+
+    ax.set_title(title)
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Basis weight")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_multi_resolution_tics(
+    curves_by_label: dict[str, np.ndarray],
+    frame_time_sec: float | None = None,
+    normalize: bool = False,
+    title: str = "ROI TIC comparison across resolutions",
+):
+    if not curves_by_label:
+        raise ValueError("curves_by_label must not be empty.")
+
+    first_curve = next(iter(curves_by_label.values()))
+    if frame_time_sec is None:
+        x = np.arange(len(first_curve))
+        xlabel = "Frame"
+    else:
+        x = np.arange(len(first_curve)) * float(frame_time_sec)
+        xlabel = "Time (s)"
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for label, curve in curves_by_label.items():
+        ax.plot(x, np.asarray(curve), linewidth=2.0, label=label)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Normalized intensity" if normalize else "Intensity")
+    ax.grid(alpha=0.25)
+    ax.legend()
     fig.tight_layout()
     return fig, ax
 
