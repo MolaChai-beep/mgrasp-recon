@@ -83,6 +83,24 @@ def is_oom_error(exc: BaseException) -> bool:
     return "out of memory" in text or "cuda out of memory" in text
 
 
+def build_traj(spokes_per_frame: int, n_time: int, base_res: int) -> np.ndarray:
+    traj = np.asarray(
+        get_traj(
+            N_spokes=spokes_per_frame,
+            N_time=n_time,
+            base_res=base_res,
+            gind=1,
+        ),
+        dtype=np.float32,
+    )
+    if traj.ndim == 3:
+        traj = traj[:, None, :, :]
+    expected_shape = (n_time, spokes_per_frame, base_res * 2, 2)
+    if traj.shape != expected_shape:
+        raise ValueError(f"traj shape {traj.shape} does not match expected {expected_shape}")
+    return traj
+
+
 def make_step1_workflow(spokes_per_frame: int, coil_thresh: float) -> BasisPreparationWorkflow:
     return BasisPreparationWorkflow(
         BasisPreparationConfig(
@@ -244,11 +262,10 @@ def run_subject_csv(
                     f"n_time={n_time}. Check spokes_per_frame={spokes_per_frame} vs n_spokes={n_spokes}"
                 )
 
-            traj = get_traj(
-                N_spokes=spokes_per_frame,
-                N_time=n_time,
+            traj = build_traj(
+                spokes_per_frame=spokes_per_frame,
+                n_time=n_time,
                 base_res=n_samples // 2,
-                gind=1,
             )
             print(
                 "  inferred dims: "
