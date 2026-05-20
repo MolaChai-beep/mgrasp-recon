@@ -1,0 +1,656 @@
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import matplotlib.pyplot as plt
+import numpy as np
+import sigpy as sp
+import torch
+
+
+def _add_repo_src_to_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    src_root = repo_root / "src"
+    if src_root.exists() and str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    return repo_root
+
+
+REPO_ROOT = _add_repo_src_to_path()
+
+from mgrasp_recon import (  # noqa: E402
+    BasisPreparationConfig,
+    BasisPreparationWorkflow,
+    CoilCalibrationConfig,
+    CoilMapEstimator,
+    LowResReconConfig,
+    ReconstructionConfig,
+    SegmentationConfig,
+    SliceReconstructionConfig,
+    SliceReconstructionWorkflow,
+    TicAnalyzer,
+)
+from mgrasp_recon.recon_utils import (  # noqa: E402
+    get_traj,
+    infer_kspace_dims,
+    list_slice_files,
+    load_slice_kspace_for_coil,
+    read_csv_config,
+    ri_to_coil_spokes_samples,
+    save_slice_h5,
+)
+from mgrasp_recon.visualization import plot_segmentation_summary  # noqa: E402
+
+
+LOWRES_SHAPE = (256, 256)
+LOWRES_TAG = "lowres_256x256"
+STEP1_NAME = "step1_basis_combined_low_res"
+STEP2_NAME = "step2_combined_basis_recon"
+COMBINED_HOP_ID = "combined_DCE_FA2_FA15_FA2p_FA15p"
+SERIES_ORDER = ("DCE", "FA2", "FA15", "FA2p", "FA15p")
+COMBINED_SPF_CANDIDATES = (8, 12, 16, 20, 24)
+MIN_NON_DCE_FRAMES = 6
+PREFERRED_NON_DCE_FRAMES = 8
+MAX_DROPPED_RATIO = 0.15
+STEP1_SLICE_IDX = 47
+LAMBDA_VALUE = 1e-3
+N_BASIS = 5
+FRAME_TIME_SEC = 3.8
+VOXEL_LIST = [(180, 120), (200, 135)]
+COIL_DEVICE = -1
+TICKER = TicAnalyzer()
+
+
+@dataclass(frozen=True)
+class SeriesInfo:
+    hop_id: str
+    hop_dir: Path
+    slice_files: list[str]
+    original_spokes_per_frame: int
+    n_coils: int
+    n_samples: int
+    n_spokes: int
+
+
+@dataclass(frozen=True)
+class RebinStats:
+    hop_id: str
+    original_spokes_per_frame: int
+    target_spokes_per_frame: int
+    n_spokes: int
+    num_frames: int
+    used_spokes: int
+    dropped_spokes: int
+
+    @property
+    def dropped_ratio(self) -> float:
+        return 0.0 if self.n_spokes == 0 else self.dropped_spokes / self.n_spokes
+
+
+def build_common_arg_parser(description: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--csv-dir", type=Path, required=True, help="Directory containing <subject_id>_config.csv files.")
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("/mnt/gdrive/DCE_MRI/RAVE_files/h5slices_wt_acqT"),
+        help="Subject root directory. Each hop is expected at <data-root>/<subject_id>/<hop_id>/",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("/mnt/gdrive/DCE_MRI/outputs/outputs"),
+        help="Output root. Results are written under <output-root>/<step_name>/<subject_id>/combined_DCE_FA2_FA15_FA2p_FA15p/lowres_256x256/",
+    )
+    parser.add_argument(
+        "--coil-thresh",
+        type=float,
+        default=0.02,
+        help="Coil threshold reused from the existing step1/step2 scripts.",
+    )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        default=None,
+        help="Optional list of subject IDs to run. Defaults to all subjects in --csv-dir.",
+    )
+    return parser
+
+
+def subject_id_from_csv(csv_path: Path) -> str:
+    suffix = "_config.csv"
+    if not csv_path.name.endswith(suffix):
+        raise ValueError(f"CSV filename must match <subject_id>{suffix}: {csv_path.name}")
+    return csv_path.name[: -len(suffix)]
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda out of memory" in text
+
+
+def _save_figure(fig, out_path: Path) -> None:
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def format_elapsed(seconds: float) -> str:
+    return f"{seconds:.2f}s"
+
+
+def filter_csv_paths(csv_paths: list[Path], subjects: list[str] | None) -> list[Path]:
+    if not subjects:
+        return csv_paths
+    selected = set(subjects)
+    return [csv_path for csv_path in csv_paths if subject_id_from_csv(csv_path) in selected]
+
+
+def load_csv_paths(csv_dir: Path, subjects: list[str] | None) -> list[Path]:
+    csv_paths = sorted(csv_dir.glob("*_config.csv"))
+    if not csv_paths:
+        raise FileNotFoundError(f"No *_config.csv files found in {csv_dir}")
+    csv_paths = filter_csv_paths(csv_paths, subjects)
+    if not csv_paths:
+        raise FileNotFoundError("No matching subject config CSVs found for --subjects.")
+    return csv_paths
+
+
+def build_traj(spokes_per_frame: int, n_time: int, base_res: int) -> np.ndarray:
+    traj = np.asarray(
+        get_traj(
+            N_spokes=spokes_per_frame,
+            N_time=n_time,
+            base_res=base_res,
+            gind=1,
+        ),
+        dtype=np.float32,
+    )
+    if traj.ndim == 3:
+        traj = traj[:, None, :, :]
+    expected_shape = (n_time, spokes_per_frame, base_res * 2, 2)
+    if traj.shape != expected_shape:
+        raise ValueError(f"traj shape {traj.shape} does not match expected {expected_shape}")
+    return traj
+
+
+def save_step1_graphs(result, graph_dir: Path) -> None:
+    img_init = np.asarray(result.img_lowres)
+    seg = result.segmentation
+
+    fig_preview, axes_preview = plt.subplots(1, 3, figsize=(12, 4))
+    for i, frame_idx in enumerate([0, img_init.shape[0] // 2, img_init.shape[0] - 1]):
+        axes_preview[i].imshow(np.abs(img_init[frame_idx]), cmap="gray")
+        axes_preview[i].set_title(f"Frame {frame_idx}")
+        axes_preview[i].axis("off")
+    _save_figure(fig_preview, graph_dir / "img_lowres_preview.png")
+
+    fig_seg, _ = plot_segmentation_summary(
+        mean_img=seg.mean_img,
+        baseline_mean=seg.baseline_mean,
+        norm_early_enh=seg.norm_early_enh,
+        std_img=seg.std_img,
+        brain_mask=seg.brain_mask,
+        brain_core_mask=seg.brain_core_mask,
+        brain_ring_mask=seg.brain_ring_mask,
+        pca_roi_mask=seg.pca_roi_mask,
+        vascular_mask=seg.vascular_mask,
+        tissue_mask=seg.tissue_mask,
+        enhancement_threshold=seg.enhancement_threshold,
+    )
+    _save_figure(fig_seg, graph_dir / "segmentation_summary.png")
+
+
+def save_step2_tic_graphs(recon_result, graph_dir: Path) -> None:
+    mean_img = recon_result.img_dyn_abs.mean(axis=0)
+    for row, col in VOXEL_LIST:
+        fig_voxel, ax_voxel = plt.subplots(figsize=(6, 6))
+        ax_voxel.imshow(mean_img, cmap="gray")
+        ax_voxel.scatter([col], [row], c="red", s=80)
+        ax_voxel.text(col + 2, row - 2, f"({row}, {col})", color="yellow")
+        ax_voxel.set_title(f"slice 47 voxel ({row}, {col})")
+        ax_voxel.axis("off")
+        _save_figure(fig_voxel, graph_dir / f"voxel_location_r{row}_c{col}.png")
+
+        curve = TICKER.extract_voxel_tic(recon_result.img_dyn_abs, (row, col), normalize=False)
+        time_axis = np.arange(len(curve)) * FRAME_TIME_SEC
+
+        fig_tic, ax_tic = plt.subplots(figsize=(7, 4))
+        ax_tic.plot(time_axis, curve, linewidth=2)
+        ax_tic.set_xlabel("Time (s)")
+        ax_tic.set_ylabel("Intensity")
+        ax_tic.set_title(f"slice 47 TIC at voxel ({row}, {col})")
+        ax_tic.grid(alpha=0.3)
+        _save_figure(fig_tic, graph_dir / f"tic_r{row}_c{col}.png")
+
+
+def make_step1_workflow(spokes_per_frame: int, coil_thresh: float) -> BasisPreparationWorkflow:
+    return BasisPreparationWorkflow(
+        BasisPreparationConfig(
+            spokes_per_frame=spokes_per_frame,
+            lowres=LowResReconConfig(
+                img_shape=LOWRES_SHAPE,
+                ns_low=256,
+                method="adjoint",
+                normalize=False,
+                return_complex=False,
+                use_ramp_filter=True,
+                verbose=True,
+            ),
+            coil=CoilCalibrationConfig(thresh=coil_thresh, verbose=True),
+            segmentation=SegmentationConfig(
+                frame_time_sec=FRAME_TIME_SEC,
+                n_baseline=5,
+                early_duration_sec=120,
+                brain_percentile=60,
+                core_erosion_iters=12,
+                roi_erosion_iters=8,
+                enhancement_percentile=75,
+                cleanup_min_size=10,
+            ),
+            nbasis=5,
+            remove_mean=True,
+            use_segmented_basis=True,
+        )
+    )
+
+
+def make_step2_workflow(
+    out_path: Path,
+    slice_idx: int,
+    coil_thresh: float,
+    recon_device,
+) -> SliceReconstructionWorkflow:
+    return SliceReconstructionWorkflow(
+        SliceReconstructionConfig(
+            recon=ReconstructionConfig(
+                nbasis=N_BASIS,
+                cbasis=False,
+                add_constant=True,
+                lamda=LAMBDA_VALUE,
+                regu="TV",
+                regu_axes=(-2, -1),
+                max_iter=10,
+                solver="ADMM",
+                use_dcf=True,
+                show_pbar=False,
+                verbose=True,
+            ),
+            coil=CoilCalibrationConfig(thresh=coil_thresh, verbose=True),
+            save_h5=False,
+            out_path=out_path,
+            hop_id=COMBINED_HOP_ID,
+            slice_idx=slice_idx,
+            coil_device=COIL_DEVICE,
+            recon_device=recon_device,
+        )
+    )
+
+
+def compute_rebin_stats(hop_id: str, original_spf: int, n_spokes: int, target_spf: int) -> RebinStats:
+    num_frames = n_spokes // target_spf
+    used_spokes = num_frames * target_spf
+    dropped_spokes = n_spokes - used_spokes
+    return RebinStats(
+        hop_id=hop_id,
+        original_spokes_per_frame=original_spf,
+        target_spokes_per_frame=target_spf,
+        n_spokes=n_spokes,
+        num_frames=num_frames,
+        used_spokes=used_spokes,
+        dropped_spokes=dropped_spokes,
+    )
+
+
+def format_stats_line(stats: RebinStats) -> str:
+    return (
+        f"{stats.hop_id}: orig_spf={stats.original_spokes_per_frame} "
+        f"target_spf={stats.target_spokes_per_frame} n_spokes={stats.n_spokes} "
+        f"frames={stats.num_frames} used={stats.used_spokes} dropped={stats.dropped_spokes} "
+        f"drop_ratio={stats.dropped_ratio:.3f}"
+    )
+
+
+def choose_combined_spokes_per_frame(series_infos: list[SeriesInfo]) -> tuple[int, list[RebinStats]]:
+    info_map = {info.hop_id: info for info in series_infos}
+    dce_info = info_map["DCE"]
+    candidates: list[tuple[int, list[RebinStats]]] = []
+
+    for candidate in COMBINED_SPF_CANDIDATES:
+        stats = [
+            compute_rebin_stats(
+                hop_id=info.hop_id,
+                original_spf=info.original_spokes_per_frame,
+                n_spokes=info.n_spokes,
+                target_spf=candidate,
+            )
+            for info in series_infos
+        ]
+        if any(item.dropped_ratio > MAX_DROPPED_RATIO for item in stats):
+            continue
+        non_dce_stats = [item for item in stats if item.hop_id != "DCE"]
+        if any(item.num_frames < MIN_NON_DCE_FRAMES for item in non_dce_stats):
+            continue
+        candidates.append((candidate, stats))
+
+    if not candidates:
+        detail = "\n".join(
+            f"  {info.hop_id}: csv_spf={info.original_spokes_per_frame} n_spokes={info.n_spokes}"
+            for info in series_infos
+        )
+        raise ValueError(
+            "No valid combined_spokes_per_frame candidate found.\n"
+            f"Candidates={COMBINED_SPF_CANDIDATES}, min_non_dce_frames={MIN_NON_DCE_FRAMES}, "
+            f"max_dropped_ratio={MAX_DROPPED_RATIO}\n{detail}"
+        )
+
+    preferred = [
+        item
+        for item in candidates
+        if all(stats.num_frames >= PREFERRED_NON_DCE_FRAMES for stats in item[1] if stats.hop_id != "DCE")
+    ]
+    if preferred:
+        candidates = preferred
+
+    candidates.sort(key=lambda item: (abs(item[0] - dce_info.original_spokes_per_frame), -item[0]))
+    return candidates[0]
+
+
+def require_series_configs(configs: list[dict[str, int]]) -> dict[str, dict[str, int]]:
+    config_map = {config["hop_id"]: config for config in configs}
+    missing = [hop_id for hop_id in SERIES_ORDER if hop_id not in config_map]
+    if missing:
+        raise ValueError(f"Missing required series in CSV: {missing}")
+    return {hop_id: config_map[hop_id] for hop_id in SERIES_ORDER}
+
+
+def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Path) -> list[SeriesInfo]:
+    config_map = require_series_configs(configs)
+    series_infos: list[SeriesInfo] = []
+    expected_num_slices: int | None = None
+    expected_geometry: tuple[int, int] | None = None
+
+    for hop_id in SERIES_ORDER:
+        config = config_map[hop_id]
+        hop_dir = subject_root / hop_id
+        if not hop_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {hop_dir}")
+
+        slice_files = list_slice_files(str(hop_dir))
+        dims = infer_kspace_dims(slice_files[0])
+        n_coils, n_samples, n_spokes = (int(dims[0]), int(dims[1]), int(dims[2]))
+
+        if expected_num_slices is None:
+            expected_num_slices = len(slice_files)
+        elif len(slice_files) != expected_num_slices:
+            raise ValueError(
+                f"Slice count mismatch for {hop_id}: expected {expected_num_slices}, got {len(slice_files)}"
+            )
+
+        geometry = (n_coils, n_samples)
+        if expected_geometry is None:
+            expected_geometry = geometry
+        elif geometry != expected_geometry:
+            raise ValueError(f"Geometry mismatch for {hop_id}: expected {expected_geometry}, got {geometry}")
+
+        series_infos.append(
+            SeriesInfo(
+                hop_id=hop_id,
+                hop_dir=hop_dir,
+                slice_files=slice_files,
+                original_spokes_per_frame=int(config["spokes_per_frame"]),
+                n_coils=n_coils,
+                n_samples=n_samples,
+                n_spokes=n_spokes,
+            )
+        )
+
+    return series_infos
+
+
+def build_combined_traj(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats]) -> np.ndarray:
+    traj_parts = [
+        build_traj(
+            spokes_per_frame=stats_map[info.hop_id].target_spokes_per_frame,
+            n_time=stats_map[info.hop_id].num_frames,
+            base_res=info.n_samples // 2,
+        )
+        for info in series_infos
+    ]
+    return np.concatenate(traj_parts, axis=0)
+
+
+def load_combined_slice_kspace(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats], slice_idx: int) -> np.ndarray:
+    ksp_parts: list[np.ndarray] = []
+    expected_geometry: tuple[int, int] | None = None
+
+    for info in series_infos:
+        stats = stats_map[info.hop_id]
+        ksp_ri = load_slice_kspace_for_coil(info.slice_files[slice_idx], verbose=False)
+        ksp = ri_to_coil_spokes_samples(ksp_ri)
+        geometry = (int(ksp.shape[0]), int(ksp.shape[2]))
+        if expected_geometry is None:
+            expected_geometry = geometry
+        elif geometry != expected_geometry:
+            raise ValueError(
+                f"Combined slice geometry mismatch at slice {slice_idx} for {info.hop_id}: "
+                f"expected {expected_geometry}, got {geometry}"
+            )
+        ksp_parts.append(np.asarray(ksp[:, : stats.used_spokes, :], dtype=np.complex64))
+
+    return np.concatenate(ksp_parts, axis=1)
+
+
+def get_recon_device():
+    return sp.Device(0 if torch.cuda.is_available() else -1)
+
+
+def recon_mode_label(recon_device) -> str:
+    return "GPU" if torch.cuda.is_available() and getattr(recon_device, "id", 0) != -1 else "CPU"
+
+
+def print_device_summary(recon_device) -> None:
+    cuda_available = torch.cuda.is_available()
+    print(f"> torch.cuda.is_available() = {cuda_available}")
+    print(f"> torch.cuda.device_count() = {torch.cuda.device_count()}")
+    if cuda_available:
+        print(f"> torch.cuda.current_device() = {torch.cuda.current_device()}")
+        print(f"> torch.cuda.get_device_name(0) = {torch.cuda.get_device_name(0)}")
+    print(f"> recon_device = {recon_device}")
+    print(f"> recon mode = {recon_mode_label(recon_device)}")
+    print(f"> coil_device = {COIL_DEVICE}")
+    print("> coil mode = CPU")
+    print("> step1 lowres path = CPU")
+
+
+def get_step1_dir(output_root: Path, subject_id: str) -> Path:
+    return output_root / STEP1_NAME / subject_id / COMBINED_HOP_ID / LOWRES_TAG
+
+
+def get_step2_dir(output_root: Path, subject_id: str) -> Path:
+    return output_root / STEP2_NAME / subject_id / COMBINED_HOP_ID / LOWRES_TAG
+
+
+def get_step1_graph_dir(output_root: Path, subject_id: str) -> Path:
+    return get_step1_dir(output_root, subject_id) / "graphs"
+
+
+def get_step2_graph_dir(output_root: Path, subject_id: str) -> Path:
+    return get_step2_dir(output_root, subject_id) / "graphs"
+
+
+def get_basis_path(output_root: Path, subject_id: str) -> Path:
+    return get_step1_dir(output_root, subject_id) / "fbasis.h5"
+
+
+def require_basis_path(output_root: Path, subject_id: str) -> Path:
+    basis_path = get_basis_path(output_root, subject_id)
+    if not basis_path.exists():
+        raise FileNotFoundError(f"Step1 basis not found for subject {subject_id}: {basis_path}")
+    return basis_path
+
+
+def print_subject_summary(series_infos: list[SeriesInfo], rebin_stats: list[RebinStats], combined_spf: int) -> None:
+    print(f"  selected combined_spf: {combined_spf}")
+    for info in series_infos:
+        print(
+            f"  {info.hop_id}: csv_spf={info.original_spokes_per_frame} "
+            f"n_spokes={info.n_spokes} n_samples={info.n_samples} n_coils={info.n_coils}"
+        )
+    for stats in rebin_stats:
+        print(f"  {format_stats_line(stats)}")
+
+
+def workflow_recon_coils(ksp: np.ndarray, coil_config: CoilCalibrationConfig):
+    return CoilMapEstimator(config=coil_config, device=COIL_DEVICE).estimate(ksp)
+
+
+def prepare_subject_inputs(csv_path: Path, data_root: Path) -> tuple[str, list[SeriesInfo], int, dict[str, RebinStats]]:
+    subject_id = subject_id_from_csv(csv_path)
+    subject_root = data_root / subject_id
+    configs = read_csv_config(csv_path)
+    series_infos = collect_subject_series_infos(configs, subject_root)
+    if STEP1_SLICE_IDX >= len(series_infos[0].slice_files):
+        raise IndexError(
+            f"STEP1_SLICE_IDX={STEP1_SLICE_IDX} outside available slice range 0..{len(series_infos[0].slice_files) - 1}"
+        )
+    combined_spf, rebin_stats = choose_combined_spokes_per_frame(series_infos)
+    return subject_id, series_infos, combined_spf, {stats.hop_id: stats for stats in rebin_stats}
+
+
+def run_step1_subject(
+    csv_path: Path,
+    data_root: Path,
+    output_root: Path,
+    coil_thresh: float,
+    recon_device,
+) -> tuple[str, Path]:
+    subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
+    rebin_stats = [stats_map[hop_id] for hop_id in SERIES_ORDER]
+    step1_dir = get_step1_dir(output_root, subject_id)
+    graph_dir = get_step1_graph_dir(output_root, subject_id)
+    step1_dir.mkdir(parents=True, exist_ok=True)
+    graph_dir.mkdir(parents=True, exist_ok=True)
+
+    print()
+    print("=" * 80)
+    print(f"step1 subject: {subject_id}")
+    print(f"csv: {csv_path}")
+    print_subject_summary(series_infos, rebin_stats, combined_spf)
+    print(f"  recon_device: {recon_device}")
+    print(f"  coil_device: {COIL_DEVICE}")
+
+    workflow = make_step1_workflow(spokes_per_frame=combined_spf, coil_thresh=coil_thresh)
+    combined_traj = build_combined_traj(series_infos, stats_map)
+    combined_ksp = load_combined_slice_kspace(series_infos, stats_map, STEP1_SLICE_IDX)
+
+    start_time = time.perf_counter()
+    mps = workflow.estimate_coils(combined_ksp)
+    img_lowres = workflow.reconstruct_lowres_series(combined_ksp, mps, traj=combined_traj)
+    segmentation = workflow.segment_vascular_and_tissue(img_lowres)
+    vascular_basis, tissue_basis, _ = workflow.estimate_segmented_basis(img_lowres, segmentation)
+    elapsed = time.perf_counter() - start_time
+
+    if vascular_basis is None or tissue_basis is None:
+        raise ValueError("Segmented basis output is required but vascular/tissue basis is missing.")
+
+    save_step1_graphs(SimpleNamespace(img_lowres=img_lowres, segmentation=segmentation), graph_dir)
+    basis = np.concatenate([vascular_basis[:, :3], tissue_basis[:, :3]], axis=1)
+    basis_path = get_basis_path(output_root, subject_id)
+    workflow.save_basis(basis, basis_path)
+
+    print(f"  step1 saved basis: {basis_path}")
+    print(f"  step1 subject={subject_id} group={COMBINED_HOP_ID} slice={STEP1_SLICE_IDX}")
+    print(f"  step1 frames={combined_traj.shape[0]} combined_spf={combined_spf}")
+    print(f"  step1 total time: {format_elapsed(elapsed)}")
+    return subject_id, basis_path
+
+
+def run_step2_subject(
+    csv_path: Path,
+    data_root: Path,
+    output_root: Path,
+    coil_thresh: float,
+    recon_device,
+) -> tuple[str, list[tuple[str, str, str, str]]]:
+    subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
+    basis_path = require_basis_path(output_root, subject_id)
+    step2_dir = get_step2_dir(output_root, subject_id)
+    graph_dir = get_step2_graph_dir(output_root, subject_id)
+    step2_dir.mkdir(parents=True, exist_ok=True)
+    graph_dir.mkdir(parents=True, exist_ok=True)
+
+    print()
+    print("=" * 80)
+    print(f"step2 subject: {subject_id}")
+    print(f"csv: {csv_path}")
+    print(f"  basis: {basis_path}")
+    print(f"  recon_device: {recon_device}")
+    print(f"  coil_device: {COIL_DEVICE}")
+
+    combined_traj = build_combined_traj(series_infos, stats_map)
+    failures: list[tuple[str, str, str, str]] = []
+    elapsed_times: list[float] = []
+    total_start = time.perf_counter()
+
+    for slice_idx in range(len(series_infos[0].slice_files)):
+        out_path = step2_dir / f"{COMBINED_HOP_ID}_slice_{slice_idx:03d}.h5"
+        workflow = make_step2_workflow(
+            out_path=out_path,
+            slice_idx=slice_idx,
+            coil_thresh=coil_thresh,
+            recon_device=recon_device,
+        )
+
+        try:
+            slice_start = time.perf_counter()
+            combined_ksp = load_combined_slice_kspace(series_infos, stats_map, slice_idx)
+            coil_maps = workflow_recon_coils(combined_ksp, workflow.config.coil)
+            recon_result = workflow.run_slice(
+                ksp=combined_ksp,
+                traj=combined_traj,
+                mps=coil_maps,
+                fbasis_path=basis_path,
+                spokes_per_frame=combined_spf,
+            )
+            save_slice_h5(
+                out_path=out_path,
+                acq_slice=np.asarray(recon_result.img_dyn),
+                hop_id=COMBINED_HOP_ID,
+                spokes_per_frame=combined_spf,
+                N_time=recon_result.img_dyn.shape[0],
+                slice_idx=slice_idx,
+                smax=np.max(recon_result.img_dyn_abs),
+            )
+            elapsed = time.perf_counter() - slice_start
+            elapsed_times.append(elapsed)
+            if slice_idx == STEP1_SLICE_IDX:
+                save_step2_tic_graphs(recon_result, graph_dir)
+            print(f"    slice {slice_idx:03d} recon time {format_elapsed(elapsed)} | saved {out_path}")
+        except Exception as exc:  # noqa: BLE001
+            if is_oom_error(exc):
+                raise
+            failures.append((subject_id, COMBINED_HOP_ID, f"slice_{slice_idx:03d}", str(exc)))
+            print(f"    FAILED slice {slice_idx:03d}: {exc}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    total_elapsed = time.perf_counter() - total_start
+    if elapsed_times:
+        avg_elapsed = total_elapsed / len(elapsed_times)
+        print(
+            f"  step2 total time: {format_elapsed(total_elapsed)} | "
+            f"avg per slice {format_elapsed(avg_elapsed)} | "
+            f"slices {len(elapsed_times)}"
+        )
+    return subject_id, failures
