@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import sys
 import time
@@ -516,6 +517,40 @@ def print_device_summary(recon_device) -> None:
     print("> step1 lowres path = CPU")
 
 
+def format_gpu_mem_stats(tag: str) -> str:
+    if not torch.cuda.is_available():
+        return f"{tag}: cuda_unavailable"
+
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    max_allocated = torch.cuda.max_memory_allocated()
+    max_reserved = torch.cuda.max_memory_reserved()
+
+    mib = 1024 ** 2
+    return (
+        f"{tag}: "
+        f"alloc={allocated / mib:.1f} MiB "
+        f"reserved={reserved / mib:.1f} MiB "
+        f"max_alloc={max_allocated / mib:.1f} MiB "
+        f"max_reserved={max_reserved / mib:.1f} MiB"
+    )
+
+
+def cleanup_slice_recon_state() -> None:
+    try:
+        import cupy as cp  # local import; optional at runtime
+
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    gc.collect()
+
+
 def get_step1_dir(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
     return output_root / STEP1_NAME / subject_id / combined_hop_id / LOWRES_TAG
 
@@ -681,11 +716,18 @@ def run_step2_subject(
             coil_thresh=coil_thresh,
             recon_device=recon_device,
         )
+        combined_ksp = None
+        coil_maps = None
+        recon_result = None
 
         try:
             slice_start = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            print(f"    {format_gpu_mem_stats(f'slice {slice_idx:03d} pre')}")
             combined_ksp = load_combined_slice_kspace(series_infos, stats_map, slice_idx)
             coil_maps = workflow_recon_coils(combined_ksp, workflow.config.coil)
+            print(f"    {format_gpu_mem_stats(f'slice {slice_idx:03d} post-coils')}")
             recon_result = workflow.run_slice(
                 ksp=combined_ksp,
                 traj=combined_traj,
@@ -693,6 +735,7 @@ def run_step2_subject(
                 fbasis_path=basis_path,
                 spokes_per_frame=combined_spf,
             )
+            print(f"    {format_gpu_mem_stats(f'slice {slice_idx:03d} post-recon')}")
             save_slice_h5(
                 out_path=out_path,
                 acq_slice=np.asarray(recon_result.img_dyn),
@@ -725,8 +768,12 @@ def run_step2_subject(
             failures.append((subject_id, combined_hop_id, f"slice_{slice_idx:03d}", str(exc)))
             print(f"    FAILED slice {slice_idx:03d}: {exc}")
         finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            recon_result = None
+            coil_maps = None
+            combined_ksp = None
+            workflow = None
+            cleanup_slice_recon_state()
+            print(f"    {format_gpu_mem_stats(f'slice {slice_idx:03d} post-cleanup')}")
 
     total_elapsed = time.perf_counter() - total_start
     if elapsed_times:
