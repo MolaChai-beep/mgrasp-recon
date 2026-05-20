@@ -403,9 +403,15 @@ def main() -> int:
     if not csv_paths:
         raise FileNotFoundError("No matching subject config CSVs found for --subjects.")
 
-    recon_device = sp.Device(0 if torch.cuda.is_available() else -1)
+    cuda_available = torch.cuda.is_available()
+    recon_device = sp.Device(0 if cuda_available else -1)
     failures: list[tuple[str, str, str, str]] = []
 
+    print(f"> torch.cuda.is_available() = {cuda_available}")
+    print(f"> torch.cuda.device_count() = {torch.cuda.device_count()}")
+    if cuda_available:
+        print(f"> torch.cuda.current_device() = {torch.cuda.current_device()}")
+        print(f"> torch.cuda.get_device_name(0) = {torch.cuda.get_device_name(0)}")
     print(f"> device {recon_device}")
     print(f"> csv count {len(csv_paths)}")
     print(f"> data root {args.data_root}")
