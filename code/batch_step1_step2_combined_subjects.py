@@ -7,6 +7,13 @@ import step2_combined_subjects
 
 def parse_args():
     parser = build_common_arg_parser("Run combined step1 then combined step2 for each subject CSV.")
+    parser.add_argument(
+        "--slice-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional 0-based slice indices to reconstruct in step2. Defaults to all slices.",
+    )
     return parser.parse_args()
 
 

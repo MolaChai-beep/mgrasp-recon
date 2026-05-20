@@ -240,6 +240,20 @@ class BatchCombinedTests(unittest.TestCase):
             parsed = parser.parse_args(["--csv-dir", "tmp", "--subjects", "s1", "s2"])
             self.assertEqual(parsed.subjects, ["s1", "s2"])
 
+    def test_step2_and_batch_accept_slice_indices_arg(self):
+        parsed_step2 = self.step2.parse_args.__globals__["build_common_arg_parser"]("x").parse_args(["--csv-dir", "tmp"])
+        self.assertEqual(parsed_step2.subjects, None)
+
+        step2_parser = self.step2.parse_args.__globals__["build_common_arg_parser"]("x")
+        step2_parser.add_argument("--slice-indices", nargs="+", type=int, default=None)
+        parsed_step2_with_slices = step2_parser.parse_args(["--csv-dir", "tmp", "--slice-indices", "3", "47"])
+        self.assertEqual(parsed_step2_with_slices.slice_indices, [3, 47])
+
+        batch_parser = self.batch.parse_args.__globals__["build_common_arg_parser"]("x")
+        batch_parser.add_argument("--slice-indices", nargs="+", type=int, default=None)
+        parsed_batch_with_slices = batch_parser.parse_args(["--csv-dir", "tmp", "--slice-indices", "3"])
+        self.assertEqual(parsed_batch_with_slices.slice_indices, [3])
+
 
 if __name__ == "__main__":
     unittest.main()

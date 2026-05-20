@@ -572,6 +572,16 @@ def prepare_subject_inputs(csv_path: Path, data_root: Path) -> tuple[str, list[S
     return subject_id, series_infos, combined_spf, {stats.hop_id: stats for stats in rebin_stats}
 
 
+def summarize_array_debug(name: str, array) -> str:
+    arr = np.asarray(array)
+    finite = np.isfinite(arr).all()
+    abs_arr = np.abs(arr)
+    return (
+        f"{name}: shape={arr.shape} dtype={arr.dtype} finite={finite} "
+        f"abs_min={float(abs_arr.min()):.6g} abs_max={float(abs_arr.max()):.6g}"
+    )
+
+
 def run_step1_subject(
     csv_path: Path,
     data_root: Path,
@@ -627,6 +637,7 @@ def run_step2_subject(
     output_root: Path,
     coil_thresh: float,
     recon_device,
+    slice_indices: list[int] | None = None,
 ) -> tuple[str, list[tuple[str, str, str, str]]]:
     subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
     combined_hop_id = build_combined_hop_id(series_infos)
@@ -648,8 +659,20 @@ def run_step2_subject(
     failures: list[tuple[str, str, str, str]] = []
     elapsed_times: list[float] = []
     total_start = time.perf_counter()
+    basis_debug = None
+    basis_h5 = None
+    try:
+        import h5py  # local import to keep module import lighter
 
-    for slice_idx in range(len(series_infos[0].slice_files)):
+        with h5py.File(basis_path, "r") as h5_file:
+            basis_h5 = np.asarray(h5_file["bases"][:])
+        basis_debug = summarize_array_debug("basis_h5", basis_h5)
+    except Exception as exc:  # noqa: BLE001
+        basis_debug = f"basis_h5: failed_to_read error={exc}"
+
+    target_slices = list(range(len(series_infos[0].slice_files))) if slice_indices is None else slice_indices
+
+    for slice_idx in target_slices:
         out_path = step2_dir / f"{combined_hop_id}_slice_{slice_idx:03d}.h5"
         workflow = make_step2_workflow(
             out_path=out_path,
@@ -690,6 +713,11 @@ def run_step2_subject(
             print(f"    DEBUG slice {slice_idx:03d} combined_hop_id={combined_hop_id}")
             for row in collect_slice_debug_rows(series_infos, stats_map, slice_idx):
                 print(f"      {row}")
+            if "combined_ksp" in locals():
+                print(f"      {summarize_array_debug('combined_ksp', combined_ksp)}")
+            if "coil_maps" in locals():
+                print(f"      {summarize_array_debug('coil_maps', coil_maps)}")
+            print(f"      {basis_debug}")
             print(
                 f"      combined_traj_shape={getattr(combined_traj, 'shape', None)} "
                 f"basis_path={basis_path}"

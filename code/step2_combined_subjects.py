@@ -13,6 +13,13 @@ from combined_subjects_common import (
 
 def parse_args():
     parser = build_common_arg_parser("Run combined step2 reconstruction for each subject CSV using an existing step1 basis.")
+    parser.add_argument(
+        "--slice-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional 0-based slice indices to reconstruct. Defaults to all slices.",
+    )
     return parser.parse_args()
 
 
@@ -35,6 +42,7 @@ def run(args) -> int:
                     output_root=args.output_root,
                     coil_thresh=args.coil_thresh,
                     recon_device=recon_device,
+                    slice_indices=args.slice_indices,
                 )
                 failures.extend(subject_failures)
             except Exception as exc:  # noqa: BLE001
