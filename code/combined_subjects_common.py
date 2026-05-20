@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -51,8 +52,6 @@ LOWRES_SHAPE = (256, 256)
 LOWRES_TAG = "lowres_256x256"
 STEP1_NAME = "step1_basis_combined_low_res"
 STEP2_NAME = "step2_combined_basis_recon"
-COMBINED_HOP_ID = "combined_DCE_FA2_FA15_FA2p_FA15p"
-SERIES_ORDER = ("DCE", "FA2", "FA15", "FA2p", "FA15p")
 COMBINED_SPF_CANDIDATES = (8, 12, 16, 20, 24)
 MIN_NON_DCE_FRAMES = 6
 PREFERRED_NON_DCE_FRAMES = 8
@@ -105,7 +104,7 @@ def build_common_arg_parser(description: str) -> argparse.ArgumentParser:
         "--output-root",
         type=Path,
         default=Path("/mnt/gdrive/DCE_MRI/outputs/outputs"),
-        help="Output root. Results are written under <output-root>/<step_name>/<subject_id>/combined_DCE_FA2_FA15_FA2p_FA15p/lowres_256x256/",
+        help="Output root. Results are written under <output-root>/<step_name>/<subject_id>/<combined_name_from_csv>/lowres_256x256/",
     )
     parser.add_argument(
         "--coil-thresh",
@@ -267,6 +266,7 @@ def make_step1_workflow(spokes_per_frame: int, coil_thresh: float) -> BasisPrepa
 def make_step2_workflow(
     out_path: Path,
     slice_idx: int,
+    combined_hop_id: str,
     coil_thresh: float,
     recon_device,
 ) -> SliceReconstructionWorkflow:
@@ -288,7 +288,7 @@ def make_step2_workflow(
             coil=CoilCalibrationConfig(thresh=coil_thresh, verbose=True),
             save_h5=False,
             out_path=out_path,
-            hop_id=COMBINED_HOP_ID,
+            hop_id=combined_hop_id,
             slice_idx=slice_idx,
             coil_device=COIL_DEVICE,
             recon_device=recon_device,
@@ -365,22 +365,23 @@ def choose_combined_spokes_per_frame(series_infos: list[SeriesInfo]) -> tuple[in
     return candidates[0]
 
 
-def require_series_configs(configs: list[dict[str, int]]) -> dict[str, dict[str, int]]:
-    config_map = {config["hop_id"]: config for config in configs}
-    missing = [hop_id for hop_id in SERIES_ORDER if hop_id not in config_map]
-    if missing:
-        raise ValueError(f"Missing required series in CSV: {missing}")
-    return {hop_id: config_map[hop_id] for hop_id in SERIES_ORDER}
+def require_series_configs(configs: list[dict[str, int]]) -> list[dict[str, int]]:
+    ordered = [config for config in configs if str(config["hop_id"]).strip()]
+    if not ordered:
+        raise ValueError("No series rows found in CSV.")
+    if not any(config["hop_id"] == "DCE" for config in ordered):
+        raise ValueError("CSV must contain one DCE row in Name column.")
+    return ordered
 
 
 def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Path) -> list[SeriesInfo]:
-    config_map = require_series_configs(configs)
+    ordered_configs = require_series_configs(configs)
     series_infos: list[SeriesInfo] = []
     expected_num_slices: int | None = None
     expected_geometry: tuple[int, int] | None = None
 
-    for hop_id in SERIES_ORDER:
-        config = config_map[hop_id]
+    for config in ordered_configs:
+        hop_id = config["hop_id"]
         hop_dir = subject_root / hop_id
         if not hop_dir.exists():
             raise FileNotFoundError(f"Directory not found: {hop_dir}")
@@ -415,6 +416,16 @@ def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Pa
         )
 
     return series_infos
+
+
+def build_combined_hop_id(series_infos: list[SeriesInfo]) -> str:
+    labels = []
+    for info in series_infos:
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", str(info.hop_id).strip()).strip("_")
+        if not safe:
+            raise ValueError(f"Invalid hop_id for combined output name: {info.hop_id!r}")
+        labels.append(safe)
+    return "combined_" + "_".join(labels)
 
 
 def build_combined_traj(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats]) -> np.ndarray:
@@ -472,28 +483,28 @@ def print_device_summary(recon_device) -> None:
     print("> step1 lowres path = CPU")
 
 
-def get_step1_dir(output_root: Path, subject_id: str) -> Path:
-    return output_root / STEP1_NAME / subject_id / COMBINED_HOP_ID / LOWRES_TAG
+def get_step1_dir(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    return output_root / STEP1_NAME / subject_id / combined_hop_id / LOWRES_TAG
 
 
-def get_step2_dir(output_root: Path, subject_id: str) -> Path:
-    return output_root / STEP2_NAME / subject_id / COMBINED_HOP_ID / LOWRES_TAG
+def get_step2_dir(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    return output_root / STEP2_NAME / subject_id / combined_hop_id / LOWRES_TAG
 
 
-def get_step1_graph_dir(output_root: Path, subject_id: str) -> Path:
-    return get_step1_dir(output_root, subject_id) / "graphs"
+def get_step1_graph_dir(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    return get_step1_dir(output_root, subject_id, combined_hop_id) / "graphs"
 
 
-def get_step2_graph_dir(output_root: Path, subject_id: str) -> Path:
-    return get_step2_dir(output_root, subject_id) / "graphs"
+def get_step2_graph_dir(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    return get_step2_dir(output_root, subject_id, combined_hop_id) / "graphs"
 
 
-def get_basis_path(output_root: Path, subject_id: str) -> Path:
-    return get_step1_dir(output_root, subject_id) / "fbasis.h5"
+def get_basis_path(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    return get_step1_dir(output_root, subject_id, combined_hop_id) / "fbasis.h5"
 
 
-def require_basis_path(output_root: Path, subject_id: str) -> Path:
-    basis_path = get_basis_path(output_root, subject_id)
+def require_basis_path(output_root: Path, subject_id: str, combined_hop_id: str) -> Path:
+    basis_path = get_basis_path(output_root, subject_id, combined_hop_id)
     if not basis_path.exists():
         raise FileNotFoundError(f"Step1 basis not found for subject {subject_id}: {basis_path}")
     return basis_path
@@ -535,9 +546,10 @@ def run_step1_subject(
     recon_device,
 ) -> tuple[str, Path]:
     subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
-    rebin_stats = [stats_map[hop_id] for hop_id in SERIES_ORDER]
-    step1_dir = get_step1_dir(output_root, subject_id)
-    graph_dir = get_step1_graph_dir(output_root, subject_id)
+    combined_hop_id = build_combined_hop_id(series_infos)
+    rebin_stats = [stats_map[info.hop_id] for info in series_infos]
+    step1_dir = get_step1_dir(output_root, subject_id, combined_hop_id)
+    graph_dir = get_step1_graph_dir(output_root, subject_id, combined_hop_id)
     step1_dir.mkdir(parents=True, exist_ok=True)
     graph_dir.mkdir(parents=True, exist_ok=True)
 
@@ -565,11 +577,11 @@ def run_step1_subject(
 
     save_step1_graphs(SimpleNamespace(img_lowres=img_lowres, segmentation=segmentation), graph_dir)
     basis = np.concatenate([vascular_basis[:, :3], tissue_basis[:, :3]], axis=1)
-    basis_path = get_basis_path(output_root, subject_id)
+    basis_path = get_basis_path(output_root, subject_id, combined_hop_id)
     workflow.save_basis(basis, basis_path)
 
     print(f"  step1 saved basis: {basis_path}")
-    print(f"  step1 subject={subject_id} group={COMBINED_HOP_ID} slice={STEP1_SLICE_IDX}")
+    print(f"  step1 subject={subject_id} group={combined_hop_id} slice={STEP1_SLICE_IDX}")
     print(f"  step1 frames={combined_traj.shape[0]} combined_spf={combined_spf}")
     print(f"  step1 total time: {format_elapsed(elapsed)}")
     return subject_id, basis_path
@@ -583,9 +595,10 @@ def run_step2_subject(
     recon_device,
 ) -> tuple[str, list[tuple[str, str, str, str]]]:
     subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
-    basis_path = require_basis_path(output_root, subject_id)
-    step2_dir = get_step2_dir(output_root, subject_id)
-    graph_dir = get_step2_graph_dir(output_root, subject_id)
+    combined_hop_id = build_combined_hop_id(series_infos)
+    basis_path = require_basis_path(output_root, subject_id, combined_hop_id)
+    step2_dir = get_step2_dir(output_root, subject_id, combined_hop_id)
+    graph_dir = get_step2_graph_dir(output_root, subject_id, combined_hop_id)
     step2_dir.mkdir(parents=True, exist_ok=True)
     graph_dir.mkdir(parents=True, exist_ok=True)
 
@@ -603,10 +616,11 @@ def run_step2_subject(
     total_start = time.perf_counter()
 
     for slice_idx in range(len(series_infos[0].slice_files)):
-        out_path = step2_dir / f"{COMBINED_HOP_ID}_slice_{slice_idx:03d}.h5"
+        out_path = step2_dir / f"{combined_hop_id}_slice_{slice_idx:03d}.h5"
         workflow = make_step2_workflow(
             out_path=out_path,
             slice_idx=slice_idx,
+            combined_hop_id=combined_hop_id,
             coil_thresh=coil_thresh,
             recon_device=recon_device,
         )
@@ -625,7 +639,7 @@ def run_step2_subject(
             save_slice_h5(
                 out_path=out_path,
                 acq_slice=np.asarray(recon_result.img_dyn),
-                hop_id=COMBINED_HOP_ID,
+                hop_id=combined_hop_id,
                 spokes_per_frame=combined_spf,
                 N_time=recon_result.img_dyn.shape[0],
                 slice_idx=slice_idx,
@@ -639,7 +653,7 @@ def run_step2_subject(
         except Exception as exc:  # noqa: BLE001
             if is_oom_error(exc):
                 raise
-            failures.append((subject_id, COMBINED_HOP_ID, f"slice_{slice_idx:03d}", str(exc)))
+            failures.append((subject_id, combined_hop_id, f"slice_{slice_idx:03d}", str(exc)))
             print(f"    FAILED slice {slice_idx:03d}: {exc}")
         finally:
             if torch.cuda.is_available():

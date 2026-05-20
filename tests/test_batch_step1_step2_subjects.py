@@ -158,7 +158,7 @@ class BatchCombinedTests(unittest.TestCase):
             self.make_info("FA2", 1, 128),
             self.make_info("FA15", 1, 128),
             self.make_info("FA2p", 1, 128),
-            self.make_info("FA15p", 1, 128),
+            self.make_info("FA13P", 1, 128),
         ]
 
         combined_spf, stats = self.common.choose_combined_spokes_per_frame(infos)
@@ -176,7 +176,7 @@ class BatchCombinedTests(unittest.TestCase):
             self.make_info("FA2", 1, 40),
             self.make_info("FA15", 1, 40),
             self.make_info("FA2p", 1, 40),
-            self.make_info("FA15p", 1, 40),
+            self.make_info("FA13P", 1, 40),
         ]
 
         with self.assertRaisesRegex(ValueError, "No valid combined_spokes_per_frame candidate found"):
@@ -190,15 +190,26 @@ class BatchCombinedTests(unittest.TestCase):
         self.assertEqual(stats.dropped_spokes, 12)
         self.assertAlmostEqual(stats.dropped_ratio, 12 / 2220)
 
-    def test_require_series_configs_reports_missing_hops(self):
-        configs = [{"hop_id": "DCE", "spokes_per_frame": 23}]
-        with self.assertRaisesRegex(ValueError, "Missing required series in CSV"):
+    def test_require_series_configs_reports_missing_dce(self):
+        configs = [{"hop_id": "FA2", "spokes_per_frame": 1}]
+        with self.assertRaisesRegex(ValueError, "CSV must contain one DCE row"):
             self.common.require_series_configs(configs)
+
+    def test_require_series_configs_uses_csv_ordered_names(self):
+        configs = [
+            {"hop_id": "FA2", "spokes_per_frame": 1},
+            {"hop_id": "FA15", "spokes_per_frame": 1},
+            {"hop_id": "DCE", "spokes_per_frame": 23},
+            {"hop_id": "FA2p", "spokes_per_frame": 1},
+            {"hop_id": "FA13P", "spokes_per_frame": 1},
+        ]
+        ordered = self.common.require_series_configs(configs)
+        self.assertEqual([item["hop_id"] for item in ordered], ["FA2", "FA15", "DCE", "FA2p", "FA13P"])
 
     def test_require_basis_path_raises_when_step1_output_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaisesRegex(FileNotFoundError, "Step1 basis not found"):
-                self.common.require_basis_path(Path(tmpdir), "subj01")
+                self.common.require_basis_path(Path(tmpdir), "subj01", "combined_DCE_FA2")
 
     def test_filter_csv_paths_is_shared_behavior(self):
         csv_paths = [
@@ -208,6 +219,17 @@ class BatchCombinedTests(unittest.TestCase):
         ]
         filtered = self.common.filter_csv_paths(csv_paths, ["subjB", "subjC"])
         self.assertEqual(filtered, [Path("subjB_config.csv"), Path("subjC_config.csv")])
+
+    def test_build_combined_hop_id_uses_csv_names_and_sanitizes(self):
+        infos = [
+            self.make_info("FA2", 1, 128),
+            self.make_info("FA 15", 1, 128),
+            self.make_info("DCE", 23, 2220),
+            self.make_info("FA2p", 1, 128),
+            self.make_info("FA13P", 1, 128),
+        ]
+        combined_hop_id = self.common.build_combined_hop_id(infos)
+        self.assertEqual(combined_hop_id, "combined_FA2_FA_15_DCE_FA2p_FA13P")
 
     def test_all_entrypoints_accept_subjects_arg(self):
         for module in (self.step1, self.step2, self.batch):
