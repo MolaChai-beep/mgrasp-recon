@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -100,6 +101,10 @@ def _save_figure(fig, out_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def _format_elapsed(seconds: float) -> str:
+    return f"{seconds:.2f}s"
 
 
 def filter_csv_paths(csv_paths: list[Path], subjects: list[str] | None) -> list[Path]:
@@ -219,7 +224,9 @@ def build_basis_for_hop(
     graph_dir: Path,
 ) -> Path:
     workflow = make_step1_workflow(spokes_per_frame=spokes_per_frame, coil_thresh=coil_thresh)
+    start_time = time.perf_counter()
     result = workflow.run(slice_files=slice_files, slice_idx=STEP1_SLICE_IDX, traj=traj)
+    elapsed = time.perf_counter() - start_time
     if result.vascular_basis is None or result.tissue_basis is None:
         raise ValueError("Segmented basis output is required but vascular/tissue basis is missing.")
     save_step1_graphs(result, graph_dir)
@@ -228,6 +235,7 @@ def build_basis_for_hop(
     workflow.save_basis(basis, basis_path)
     print(f"  step1 saved basis: {basis_path}")
     print(f"  step1 subject={subject_id} hop={hop_id} slice={STEP1_SLICE_IDX}")
+    print(f"  step1 time: {_format_elapsed(elapsed)}")
     return basis_path
 
 
@@ -244,6 +252,8 @@ def reconstruct_all_slices_for_hop(
     graph_dir: Path,
 ) -> list[tuple[str, str, str, str]]:
     failures: list[tuple[str, str, str, str]] = []
+    elapsed_times: list[float] = []
+    step2_start_time = time.perf_counter()
 
     for slice_idx, slice_file in enumerate(slice_files):
         out_path = step2_dir / f"{hop_id}_slice_{slice_idx:03d}.h5"
@@ -273,6 +283,7 @@ def reconstruct_all_slices_for_hop(
         )
 
         try:
+            slice_start_time = time.perf_counter()
             recon_result = workflow.reconstruct_slice(
                 slice_file=slice_file,
                 traj=traj,
@@ -280,9 +291,11 @@ def reconstruct_all_slices_for_hop(
                 spokes_per_frame=spokes_per_frame,
                 slice_idx=slice_idx,
             )
+            elapsed = time.perf_counter() - slice_start_time
+            elapsed_times.append(elapsed)
             if slice_idx == STEP1_SLICE_IDX:
                 save_step2_tic_graphs(recon_result, graph_dir)
-            print(f"    step2 saved slice {slice_idx:03d}: {out_path}")
+            print(f"    step2 saved slice {slice_idx:03d}: {out_path} | time {_format_elapsed(elapsed)}")
         except Exception as exc:  # noqa: BLE001
             if is_oom_error(exc):
                 raise
@@ -291,6 +304,15 @@ def reconstruct_all_slices_for_hop(
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    total_elapsed = time.perf_counter() - step2_start_time
+    if elapsed_times:
+        avg_elapsed = total_elapsed / len(elapsed_times)
+        print(
+            f"  step2 total time: {_format_elapsed(total_elapsed)} | "
+            f"avg per slice {_format_elapsed(avg_elapsed)} | "
+            f"slices {len(elapsed_times)}"
+        )
 
     return failures
 
