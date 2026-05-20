@@ -3,10 +3,13 @@ from __future__ import annotations
 from combined_subjects_common import (
     build_common_arg_parser,
     get_recon_device,
+    get_subject_log_path,
     is_oom_error,
     load_csv_paths,
     print_device_summary,
     run_step1_subject,
+    subject_id_from_csv,
+    tee_subject_log,
 )
 
 
@@ -27,18 +30,21 @@ def run(args) -> int:
 
     try:
         for csv_path in csv_paths:
+            subject_id = subject_id_from_csv(csv_path)
+            log_path = get_subject_log_path(args.output_root, "step1_combined_subjects", subject_id)
             try:
-                run_step1_subject(
-                    csv_path=csv_path,
-                    data_root=args.data_root,
-                    output_root=args.output_root,
-                    coil_thresh=args.coil_thresh,
-                    recon_device=recon_device,
-                )
+                with tee_subject_log(log_path):
+                    run_step1_subject(
+                        csv_path=csv_path,
+                        data_root=args.data_root,
+                        output_root=args.output_root,
+                        coil_thresh=args.coil_thresh,
+                        recon_device=recon_device,
+                    )
             except Exception as exc:  # noqa: BLE001
                 if is_oom_error(exc):
                     print()
-                    print(f"STOPPED: OOM at subject={csv_path.stem}")
+                    print(f"STOPPED: OOM at subject={subject_id}")
                     return 2
                 failures.append((csv_path.name, str(exc)))
                 print(f"  FAILED step1 for {csv_path.name}: {exc}")

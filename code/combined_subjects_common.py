@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
+import io
 import re
 import sys
 import time
@@ -38,7 +40,6 @@ from mgrasp_recon import (  # noqa: E402
     TicAnalyzer,
 )
 from mgrasp_recon.recon_utils import (  # noqa: E402
-    get_traj,
     infer_kspace_dims,
     list_slice_files,
     load_slice_kspace_for_coil,
@@ -53,7 +54,7 @@ LOWRES_SHAPE = (256, 256)
 LOWRES_TAG = "lowres_256x256"
 STEP1_NAME = "step1_basis_combined_low_res"
 STEP2_NAME = "step2_combined_basis_recon"
-COMBINED_SPF_CANDIDATES = (8, 12, 16, 20, 24)
+FIXED_COMBINED_SPF = 21
 MIN_NON_DCE_FRAMES = 6
 PREFERRED_NON_DCE_FRAMES = 8
 MAX_DROPPED_RATIO = 0.15
@@ -89,6 +90,7 @@ class RebinStats:
     num_frames: int
     used_spokes: int
     dropped_spokes: int
+    start_spoke: int
 
     @property
     def dropped_ratio(self) -> float:
@@ -169,17 +171,27 @@ def load_csv_paths(csv_dir: Path, subjects: list[str] | None) -> list[Path]:
 
 
 def build_traj(spokes_per_frame: int, n_time: int, base_res: int) -> np.ndarray:
-    traj = np.asarray(
-        get_traj(
-            N_spokes=spokes_per_frame,
-            N_time=n_time,
-            base_res=base_res,
-            gind=1,
-        ),
-        dtype=np.float32,
+    return build_traj_with_offset(
+        spokes_per_frame=spokes_per_frame,
+        n_time=n_time,
+        base_res=base_res,
+        start_spoke=0,
     )
-    if traj.ndim == 3:
-        traj = traj[:, None, :, :]
+
+
+def build_traj_with_offset(spokes_per_frame: int, n_time: int, base_res: int, start_spoke: int) -> np.ndarray:
+    n_tot_spokes = spokes_per_frame * n_time
+    n_samples = base_res * 2
+    base_lin = np.arange(n_samples, dtype=np.float32).reshape(1, -1) - (n_samples - 1) / 2
+    tau = 0.5 * (1 + 5**0.5)
+    base_rad = np.pi / tau
+    base_rot = (start_spoke + np.arange(n_tot_spokes, dtype=np.float32)).reshape(-1, 1) * base_rad
+
+    traj = np.zeros((n_tot_spokes, n_samples, 2), dtype=np.float32)
+    traj[..., 0] = np.cos(base_rot) @ base_lin
+    traj[..., 1] = np.sin(base_rot) @ base_lin
+    traj /= 2
+    traj = traj.reshape(n_time, spokes_per_frame, n_samples, 2)
     expected_shape = (n_time, spokes_per_frame, base_res * 2, 2)
     if traj.shape != expected_shape:
         raise ValueError(f"traj shape {traj.shape} does not match expected {expected_shape}")
@@ -304,6 +316,7 @@ def compute_rebin_stats(hop_id: str, original_spf: int, n_spokes: int, target_sp
     num_frames = n_spokes // target_spf
     used_spokes = num_frames * target_spf
     dropped_spokes = n_spokes - used_spokes
+    start_spoke = dropped_spokes
     return RebinStats(
         hop_id=hop_id,
         original_spokes_per_frame=original_spf,
@@ -312,61 +325,48 @@ def compute_rebin_stats(hop_id: str, original_spf: int, n_spokes: int, target_sp
         num_frames=num_frames,
         used_spokes=used_spokes,
         dropped_spokes=dropped_spokes,
+        start_spoke=start_spoke,
     )
 
 
 def format_stats_line(stats: RebinStats) -> str:
+    stop_spoke = stats.start_spoke + stats.used_spokes
     return (
         f"{stats.hop_id}: orig_spf={stats.original_spokes_per_frame} "
         f"target_spf={stats.target_spokes_per_frame} n_spokes={stats.n_spokes} "
         f"frames={stats.num_frames} used={stats.used_spokes} dropped={stats.dropped_spokes} "
+        f"discard_first={stats.start_spoke} used_range=[{stats.start_spoke}:{stop_spoke}) "
         f"drop_ratio={stats.dropped_ratio:.3f}"
     )
 
 
 def choose_combined_spokes_per_frame(series_infos: list[SeriesInfo]) -> tuple[int, list[RebinStats]]:
-    info_map = {info.hop_id: info for info in series_infos}
-    dce_info = info_map["DCE"]
-    candidates: list[tuple[int, list[RebinStats]]] = []
-
-    for candidate in COMBINED_SPF_CANDIDATES:
-        stats = [
-            compute_rebin_stats(
-                hop_id=info.hop_id,
-                original_spf=info.original_spokes_per_frame,
-                n_spokes=info.n_spokes,
-                target_spf=candidate,
-            )
-            for info in series_infos
-        ]
-        if any(item.dropped_ratio > MAX_DROPPED_RATIO for item in stats):
-            continue
-        non_dce_stats = [item for item in stats if item.hop_id != "DCE"]
-        if any(item.num_frames < MIN_NON_DCE_FRAMES for item in non_dce_stats):
-            continue
-        candidates.append((candidate, stats))
-
-    if not candidates:
+    stats = [
+        compute_rebin_stats(
+            hop_id=info.hop_id,
+            original_spf=info.original_spokes_per_frame,
+            n_spokes=info.n_spokes,
+            target_spf=FIXED_COMBINED_SPF,
+        )
+        for info in series_infos
+    ]
+    if any(item.dropped_ratio > MAX_DROPPED_RATIO for item in stats):
         detail = "\n".join(
             f"  {info.hop_id}: csv_spf={info.original_spokes_per_frame} n_spokes={info.n_spokes}"
             for info in series_infos
         )
         raise ValueError(
-            "No valid combined_spokes_per_frame candidate found.\n"
-            f"Candidates={COMBINED_SPF_CANDIDATES}, min_non_dce_frames={MIN_NON_DCE_FRAMES}, "
-            f"max_dropped_ratio={MAX_DROPPED_RATIO}\n{detail}"
+            "Fixed combined_spokes_per_frame is invalid for this subject.\n"
+            f"combined_spf={FIXED_COMBINED_SPF}, max_dropped_ratio={MAX_DROPPED_RATIO}\n{detail}"
         )
-
-    preferred = [
-        item
-        for item in candidates
-        if all(stats.num_frames >= PREFERRED_NON_DCE_FRAMES for stats in item[1] if stats.hop_id != "DCE")
-    ]
-    if preferred:
-        candidates = preferred
-
-    candidates.sort(key=lambda item: (abs(item[0] - dce_info.original_spokes_per_frame), -item[0]))
-    return candidates[0]
+    non_dce_stats = [item for item in stats if item.hop_id != "DCE"]
+    if any(item.num_frames < MIN_NON_DCE_FRAMES for item in non_dce_stats):
+        detail = "\n".join(format_stats_line(item) for item in stats)
+        raise ValueError(
+            "Fixed combined_spokes_per_frame does not leave enough non-DCE frames.\n"
+            f"combined_spf={FIXED_COMBINED_SPF}, min_non_dce_frames={MIN_NON_DCE_FRAMES}\n{detail}"
+        )
+    return FIXED_COMBINED_SPF, stats
 
 
 def require_series_configs(configs: list[dict[str, int]]) -> list[dict[str, int]]:
@@ -450,10 +450,11 @@ def build_combined_hop_id(series_infos: list[SeriesInfo]) -> str:
 
 def build_combined_traj(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats]) -> np.ndarray:
     traj_parts = [
-        build_traj(
+        build_traj_with_offset(
             spokes_per_frame=stats_map[info.hop_id].target_spokes_per_frame,
             n_time=stats_map[info.hop_id].num_frames,
             base_res=info.n_samples // 2,
+            start_spoke=stats_map[info.hop_id].start_spoke,
         )
         for info in series_infos
     ]
@@ -476,7 +477,8 @@ def load_combined_slice_kspace(series_infos: list[SeriesInfo], stats_map: dict[s
                 f"Combined slice geometry mismatch at slice {slice_idx} for {info.hop_id}: "
                 f"expected {expected_geometry}, got {geometry}"
             )
-        ksp_parts.append(np.asarray(ksp[:, : stats.used_spokes, :], dtype=np.complex64))
+        stop_spoke = stats.start_spoke + stats.used_spokes
+        ksp_parts.append(np.asarray(ksp[:, stats.start_spoke:stop_spoke, :], dtype=np.complex64))
 
     return np.concatenate(ksp_parts, axis=1)
 
@@ -588,6 +590,38 @@ def print_subject_summary(series_infos: list[SeriesInfo], rebin_stats: list[Rebi
         )
     for stats in rebin_stats:
         print(f"  {format_stats_line(stats)}")
+
+
+class TeeStream(io.TextIOBase):
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def get_subject_log_path(output_root: Path, step_name: str, subject_id: str) -> Path:
+    log_dir = output_root / "logs" / step_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"{subject_id}.log"
+
+
+@contextlib.contextmanager
+def tee_subject_log(log_path: Path):
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        tee_out = TeeStream(sys.stdout, log_file)
+        tee_err = TeeStream(sys.stderr, log_file)
+        with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
+            print()
+            print(f"> subject log: {log_path}")
+            yield
 
 
 def workflow_recon_coils(ksp: np.ndarray, coil_config: CoilCalibrationConfig):

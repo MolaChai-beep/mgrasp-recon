@@ -3,11 +3,13 @@ from __future__ import annotations
 from combined_subjects_common import (
     build_common_arg_parser,
     get_recon_device,
+    get_subject_log_path,
     is_oom_error,
     load_csv_paths,
     print_device_summary,
     run_step2_subject,
     subject_id_from_csv,
+    tee_subject_log,
 )
 
 
@@ -35,22 +37,25 @@ def run(args) -> int:
 
     try:
         for csv_path in csv_paths:
+            subject_id = subject_id_from_csv(csv_path)
+            log_path = get_subject_log_path(args.output_root, "step2_combined_subjects", subject_id)
             try:
-                _, subject_failures = run_step2_subject(
-                    csv_path=csv_path,
-                    data_root=args.data_root,
-                    output_root=args.output_root,
-                    coil_thresh=args.coil_thresh,
-                    recon_device=recon_device,
-                    slice_indices=args.slice_indices,
-                )
-                failures.extend(subject_failures)
+                with tee_subject_log(log_path):
+                    _, subject_failures = run_step2_subject(
+                        csv_path=csv_path,
+                        data_root=args.data_root,
+                        output_root=args.output_root,
+                        coil_thresh=args.coil_thresh,
+                        recon_device=recon_device,
+                        slice_indices=args.slice_indices,
+                    )
+                    failures.extend(subject_failures)
             except Exception as exc:  # noqa: BLE001
                 if is_oom_error(exc):
                     print()
-                    print(f"STOPPED: OOM at subject={subject_id_from_csv(csv_path)}")
+                    print(f"STOPPED: OOM at subject={subject_id}")
                     return 2
-                failures.append((subject_id_from_csv(csv_path), "step2", "subject", str(exc)))
+                failures.append((subject_id, "step2", "subject", str(exc)))
                 print(f"  FAILED step2 for {csv_path.name}: {exc}")
     finally:
         pass
