@@ -35,6 +35,11 @@ def read_csv_config(csv_path):
             configs.append(
                 {
                     "hop_id": name,
+                    "n_par": int(row["nPar"]),
+                    "n_eco": int(row["nEco"]),
+                    "n_points": int(row["nPoints"]),
+                    "n_coils": int(row["nCoils"]),
+                    "n_spokes": int(row["nSpokes"]),
                     "spokes_per_frame": int(row["spokes_per_frame"]),
                     "slice_idx": int(row["slice_idx"]),
                     "slice_inc": int(row["slice_inc"]),

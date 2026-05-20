@@ -71,6 +71,9 @@ class SeriesInfo:
     hop_dir: Path
     slice_files: list[str]
     original_spokes_per_frame: int
+    images_per_slab: int
+    csv_n_par: int
+    csv_n_eco: int
     n_coils: int
     n_samples: int
     n_spokes: int
@@ -388,13 +391,26 @@ def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Pa
 
         slice_files = list_slice_files(str(hop_dir))
         dims = infer_kspace_dims(slice_files[0])
-        n_coils, n_samples, n_spokes = (int(dims[0]), int(dims[1]), int(dims[2]))
+        h5_n_coils, h5_n_samples, h5_n_spokes = (int(dims[0]), int(dims[1]), int(dims[2]))
+        csv_n_coils = int(config["n_coils"])
+        csv_n_samples = int(config["n_points"])
+        csv_n_spokes = int(config["n_spokes"])
+        n_coils, n_samples, n_spokes = csv_n_coils, csv_n_samples, csv_n_spokes
 
         if expected_num_slices is None:
-            expected_num_slices = len(slice_files)
-        elif len(slice_files) != expected_num_slices:
+            expected_num_slices = int(config["images_per_slab"])
+        if len(slice_files) != int(config["images_per_slab"]):
+            raise ValueError(
+                f"Slice count mismatch for {hop_id}: csv images_per_slab={config['images_per_slab']}, files={len(slice_files)}"
+            )
+        if len(slice_files) != expected_num_slices:
             raise ValueError(
                 f"Slice count mismatch for {hop_id}: expected {expected_num_slices}, got {len(slice_files)}"
+            )
+        if (h5_n_coils, h5_n_samples, h5_n_spokes) != (csv_n_coils, csv_n_samples, csv_n_spokes):
+            raise ValueError(
+                f"CSV/H5 mismatch for {hop_id}: csv={(csv_n_coils, csv_n_samples, csv_n_spokes)} "
+                f"h5={(h5_n_coils, h5_n_samples, h5_n_spokes)}"
             )
 
         geometry = (n_coils, n_samples)
@@ -409,6 +425,9 @@ def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Pa
                 hop_dir=hop_dir,
                 slice_files=slice_files,
                 original_spokes_per_frame=int(config["spokes_per_frame"]),
+                images_per_slab=int(config["images_per_slab"]),
+                csv_n_par=int(config["n_par"]),
+                csv_n_eco=int(config["n_eco"]),
                 n_coils=n_coils,
                 n_samples=n_samples,
                 n_spokes=n_spokes,
@@ -459,6 +478,20 @@ def load_combined_slice_kspace(series_infos: list[SeriesInfo], stats_map: dict[s
         ksp_parts.append(np.asarray(ksp[:, : stats.used_spokes, :], dtype=np.complex64))
 
     return np.concatenate(ksp_parts, axis=1)
+
+
+def collect_slice_debug_rows(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats], slice_idx: int) -> list[str]:
+    rows: list[str] = []
+    for info in series_infos:
+        stats = stats_map[info.hop_id]
+        dims = infer_kspace_dims(info.slice_files[slice_idx])
+        rows.append(
+            f"{info.hop_id}: h5_shape={tuple(int(dim) for dim in dims)} "
+            f"csv_expected=(coils={info.n_coils}, samples={info.n_samples}, spokes={info.n_spokes}) "
+            f"used_spokes={stats.used_spokes} target_spf={stats.target_spokes_per_frame} "
+            f"file={info.slice_files[slice_idx]}"
+        )
+    return rows
 
 
 def get_recon_device():
@@ -515,7 +548,8 @@ def print_subject_summary(series_infos: list[SeriesInfo], rebin_stats: list[Rebi
     for info in series_infos:
         print(
             f"  {info.hop_id}: csv_spf={info.original_spokes_per_frame} "
-            f"n_spokes={info.n_spokes} n_samples={info.n_samples} n_coils={info.n_coils}"
+            f"n_spokes={info.n_spokes} n_samples={info.n_samples} n_coils={info.n_coils} "
+            f"images_per_slab={info.images_per_slab}"
         )
     for stats in rebin_stats:
         print(f"  {format_stats_line(stats)}")
@@ -653,6 +687,13 @@ def run_step2_subject(
         except Exception as exc:  # noqa: BLE001
             if is_oom_error(exc):
                 raise
+            print(f"    DEBUG slice {slice_idx:03d} combined_hop_id={combined_hop_id}")
+            for row in collect_slice_debug_rows(series_infos, stats_map, slice_idx):
+                print(f"      {row}")
+            print(
+                f"      combined_traj_shape={getattr(combined_traj, 'shape', None)} "
+                f"basis_path={basis_path}"
+            )
             failures.append((subject_id, combined_hop_id, f"slice_{slice_idx:03d}", str(exc)))
             print(f"    FAILED slice {slice_idx:03d}: {exc}")
         finally:

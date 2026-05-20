@@ -111,7 +111,7 @@ def install_stubs():
 
         recon_utils_stub = types.ModuleType("mgrasp_recon.recon_utils")
         recon_utils_stub.get_traj = lambda **kwargs: []
-        recon_utils_stub.infer_kspace_dims = lambda *args, **kwargs: (34, 512, 128, 2)
+        recon_utils_stub.infer_kspace_dims = lambda *args, **kwargs: (64, 512, 128, 2)
         recon_utils_stub.list_slice_files = lambda *args, **kwargs: []
         recon_utils_stub.load_slice_kspace_for_coil = lambda *args, **kwargs: None
         recon_utils_stub.read_csv_config = lambda *args, **kwargs: []
@@ -147,6 +147,9 @@ class BatchCombinedTests(unittest.TestCase):
             hop_dir=Path(f"/tmp/{hop_id}"),
             slice_files=["slice001.h5"] * 96,
             original_spokes_per_frame=csv_spf,
+            images_per_slab=96,
+            csv_n_par=96,
+            csv_n_eco=1,
             n_coils=34,
             n_samples=512,
             n_spokes=n_spokes,
@@ -197,11 +200,11 @@ class BatchCombinedTests(unittest.TestCase):
 
     def test_require_series_configs_uses_csv_ordered_names(self):
         configs = [
-            {"hop_id": "FA2", "spokes_per_frame": 1},
-            {"hop_id": "FA15", "spokes_per_frame": 1},
-            {"hop_id": "DCE", "spokes_per_frame": 23},
-            {"hop_id": "FA2p", "spokes_per_frame": 1},
-            {"hop_id": "FA13P", "spokes_per_frame": 1},
+            {"hop_id": "FA2", "spokes_per_frame": 1, "images_per_slab": 96, "n_par": 96, "n_eco": 1, "n_points": 512, "n_coils": 64, "n_spokes": 128},
+            {"hop_id": "FA15", "spokes_per_frame": 1, "images_per_slab": 96, "n_par": 96, "n_eco": 1, "n_points": 512, "n_coils": 64, "n_spokes": 128},
+            {"hop_id": "DCE", "spokes_per_frame": 23, "images_per_slab": 96, "n_par": 96, "n_eco": 1, "n_points": 512, "n_coils": 64, "n_spokes": 2220},
+            {"hop_id": "FA2p", "spokes_per_frame": 1, "images_per_slab": 96, "n_par": 96, "n_eco": 1, "n_points": 512, "n_coils": 64, "n_spokes": 128},
+            {"hop_id": "FA13P", "spokes_per_frame": 1, "images_per_slab": 96, "n_par": 96, "n_eco": 1, "n_points": 512, "n_coils": 64, "n_spokes": 128},
         ]
         ordered = self.common.require_series_configs(configs)
         self.assertEqual([item["hop_id"] for item in ordered], ["FA2", "FA15", "DCE", "FA2p", "FA13P"])
