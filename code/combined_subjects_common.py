@@ -124,6 +124,12 @@ def build_common_arg_parser(description: str) -> argparse.ArgumentParser:
         default=None,
         help="Optional list of subject IDs to run. Defaults to all subjects in --csv-dir.",
     )
+    parser.add_argument(
+        "--step1-hop-id",
+        type=str,
+        default="DCE",
+        help="Sequence/hop to use for step1 lowres reconstruction, segmentation, and basis generation.",
+    )
     return parser
 
 
@@ -438,6 +444,14 @@ def collect_subject_series_infos(configs: list[dict[str, int]], subject_root: Pa
     return series_infos
 
 
+def select_step1_series_info(series_infos: list[SeriesInfo], step1_hop_id: str = "DCE") -> SeriesInfo:
+    for info in series_infos:
+        if info.hop_id == step1_hop_id:
+            return info
+    available = ", ".join(info.hop_id for info in series_infos)
+    raise ValueError(f"step1 hop_id {step1_hop_id!r} not found. Available: {available}")
+
+
 def build_combined_hop_id(series_infos: list[SeriesInfo]) -> str:
     labels = []
     for info in series_infos:
@@ -461,6 +475,15 @@ def build_combined_traj(series_infos: list[SeriesInfo], stats_map: dict[str, Reb
     return np.concatenate(traj_parts, axis=0)
 
 
+def build_series_traj(info: SeriesInfo, stats: RebinStats) -> np.ndarray:
+    return build_traj_with_offset(
+        spokes_per_frame=stats.target_spokes_per_frame,
+        n_time=stats.num_frames,
+        base_res=info.n_samples // 2,
+        start_spoke=stats.start_spoke,
+    )
+
+
 def load_combined_slice_kspace(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats], slice_idx: int) -> np.ndarray:
     ksp_parts: list[np.ndarray] = []
     expected_geometry: tuple[int, int] | None = None
@@ -481,6 +504,13 @@ def load_combined_slice_kspace(series_infos: list[SeriesInfo], stats_map: dict[s
         ksp_parts.append(np.asarray(ksp[:, stats.start_spoke:stop_spoke, :], dtype=np.complex64))
 
     return np.concatenate(ksp_parts, axis=1)
+
+
+def load_series_slice_kspace(info: SeriesInfo, stats: RebinStats, slice_idx: int) -> np.ndarray:
+    ksp_ri = load_slice_kspace_for_coil(info.slice_files[slice_idx], verbose=False)
+    ksp = ri_to_coil_spokes_samples(ksp_ri)
+    stop_spoke = stats.start_spoke + stats.used_spokes
+    return np.asarray(ksp[:, stats.start_spoke:stop_spoke, :], dtype=np.complex64)
 
 
 def collect_slice_debug_rows(series_infos: list[SeriesInfo], stats_map: dict[str, RebinStats], slice_idx: int) -> list[str]:
@@ -641,6 +671,33 @@ def prepare_subject_inputs(csv_path: Path, data_root: Path) -> tuple[str, list[S
     return subject_id, series_infos, combined_spf, {stats.hop_id: stats for stats in rebin_stats}
 
 
+def save_step1_debug_artifacts(
+    graph_dir: Path,
+    step1_info: SeriesInfo,
+    step1_stats: RebinStats,
+    segmentation,
+) -> None:
+    metadata_lines = [
+        f"step1_hop_id={step1_info.hop_id}",
+        f"step1_original_spf={step1_info.original_spokes_per_frame}",
+        f"step1_target_spf={step1_stats.target_spokes_per_frame}",
+        f"step1_num_frames={step1_stats.num_frames}",
+        f"step1_used_spokes={step1_stats.used_spokes}",
+        f"step1_dropped_spokes={step1_stats.dropped_spokes}",
+        f"step1_start_spoke={step1_stats.start_spoke}",
+        f"baseline_idx={list(np.asarray(segmentation.baseline_idx, dtype=int))}",
+        f"early_idx={list(np.asarray(segmentation.early_idx, dtype=int))}",
+    ]
+    (graph_dir / "step1_debug_info.txt").write_text("\n".join(metadata_lines) + "\n", encoding="utf-8")
+
+    np.save(graph_dir / "baseline_idx.npy", np.asarray(segmentation.baseline_idx, dtype=np.int32))
+    np.save(graph_dir / "early_idx.npy", np.asarray(segmentation.early_idx, dtype=np.int32))
+    np.save(graph_dir / "norm_early_enh.npy", np.asarray(segmentation.norm_early_enh, dtype=np.float32))
+    np.save(graph_dir / "pre_cleanup_vascular_mask.npy", np.asarray(segmentation.pre_cleanup_vascular_mask, dtype=bool))
+    np.save(graph_dir / "vascular_mask.npy", np.asarray(segmentation.vascular_mask, dtype=bool))
+    np.save(graph_dir / "tissue_mask.npy", np.asarray(segmentation.tissue_mask, dtype=bool))
+
+
 def summarize_array_debug(name: str, array) -> str:
     arr = np.asarray(array)
     finite = np.isfinite(arr).all()
@@ -657,9 +714,17 @@ def run_step1_subject(
     output_root: Path,
     coil_thresh: float,
     recon_device,
+    step1_hop_id: str = "DCE",
 ) -> tuple[str, Path]:
     subject_id, series_infos, combined_spf, stats_map = prepare_subject_inputs(csv_path, data_root)
     combined_hop_id = build_combined_hop_id(series_infos)
+    step1_info = select_step1_series_info(series_infos, step1_hop_id=step1_hop_id)
+    step1_stats = compute_rebin_stats(
+        hop_id=step1_info.hop_id,
+        original_spf=step1_info.original_spokes_per_frame,
+        n_spokes=step1_info.n_spokes,
+        target_spf=step1_info.original_spokes_per_frame,
+    )
     rebin_stats = [stats_map[info.hop_id] for info in series_infos]
     step1_dir = get_step1_dir(output_root, subject_id, combined_hop_id)
     graph_dir = get_step1_graph_dir(output_root, subject_id, combined_hop_id)
@@ -673,14 +738,16 @@ def run_step1_subject(
     print_subject_summary(series_infos, rebin_stats, combined_spf)
     print(f"  recon_device: {recon_device}")
     print(f"  coil_device: {COIL_DEVICE}")
+    print(f"  step1_hop_id: {step1_info.hop_id}")
+    print(f"  {format_stats_line(step1_stats)}")
 
-    workflow = make_step1_workflow(spokes_per_frame=combined_spf, coil_thresh=coil_thresh)
-    combined_traj = build_combined_traj(series_infos, stats_map)
-    combined_ksp = load_combined_slice_kspace(series_infos, stats_map, STEP1_SLICE_IDX)
+    workflow = make_step1_workflow(spokes_per_frame=step1_stats.target_spokes_per_frame, coil_thresh=coil_thresh)
+    step1_traj = build_series_traj(step1_info, step1_stats)
+    step1_ksp = load_series_slice_kspace(step1_info, step1_stats, STEP1_SLICE_IDX)
 
     start_time = time.perf_counter()
-    mps = workflow.estimate_coils(combined_ksp)
-    img_lowres = workflow.reconstruct_lowres_series(combined_ksp, mps, traj=combined_traj)
+    mps = workflow.estimate_coils(step1_ksp)
+    img_lowres = workflow.reconstruct_lowres_series(step1_ksp, mps, traj=step1_traj)
     segmentation = workflow.segment_vascular_and_tissue(img_lowres)
     vascular_basis, tissue_basis, _ = workflow.estimate_segmented_basis(img_lowres, segmentation)
     elapsed = time.perf_counter() - start_time
@@ -689,13 +756,14 @@ def run_step1_subject(
         raise ValueError("Segmented basis output is required but vascular/tissue basis is missing.")
 
     save_step1_graphs(SimpleNamespace(img_lowres=img_lowres, segmentation=segmentation), graph_dir)
+    save_step1_debug_artifacts(graph_dir, step1_info, step1_stats, segmentation)
     basis = np.concatenate([vascular_basis[:, :3], tissue_basis[:, :3]], axis=1)
     basis_path = get_basis_path(output_root, subject_id, combined_hop_id)
     workflow.save_basis(basis, basis_path)
 
     print(f"  step1 saved basis: {basis_path}")
     print(f"  step1 subject={subject_id} group={combined_hop_id} slice={STEP1_SLICE_IDX}")
-    print(f"  step1 frames={combined_traj.shape[0]} combined_spf={combined_spf}")
+    print(f"  step1 source_hop={step1_info.hop_id} frames={step1_traj.shape[0]} spf={step1_stats.target_spokes_per_frame}")
     print(f"  step1 total time: {format_elapsed(elapsed)}")
     return subject_id, basis_path
 

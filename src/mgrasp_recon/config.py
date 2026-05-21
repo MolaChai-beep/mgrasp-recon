@@ -74,6 +74,8 @@ class SegmentationConfig:
     cleanup_min_size: int = 10
     cleanup_open_iters: int = 1
     cleanup_close_iters: int = 1
+    std_percentile: float = 60
+    peak_ratio_percentile: float = 60
     smooth_sigma: float = 2.0
     vessel_percentile: float = 90
     opening_iters: int = 1
@@ -111,6 +113,7 @@ class SegmentationResult:
     brain_core_mask: np.ndarray | None
     brain_ring_mask: np.ndarray | None
     pca_roi_mask: np.ndarray | None
+    pre_cleanup_vascular_mask: np.ndarray | None
     vascular_mask: np.ndarray
     tissue_mask: np.ndarray
     brain_mask_threshold: float
@@ -131,6 +134,7 @@ class SegmentationResult:
             "brain_core_mask": self.brain_core_mask,
             "brain_ring_mask": self.brain_ring_mask,
             "pca_roi_mask": self.pca_roi_mask,
+            "pre_cleanup_vascular_mask": self.pre_cleanup_vascular_mask,
             "vascular_mask": self.vascular_mask,
             "tissue_mask": self.tissue_mask,
             "brain_mask_threshold": self.brain_mask_threshold,

@@ -56,11 +56,31 @@ def _segment_enhancement_series(img_init, config: SegmentationConfig | None = No
 
     enh_vals = norm_early_enh[pca_roi_mask]
     if enh_vals.size == 0:
+        pca_roi_mask = brain_core_mask.copy()
+        enh_vals = norm_early_enh[pca_roi_mask]
+    if enh_vals.size == 0:
         pca_roi_mask = brain_mask.copy()
         enh_vals = norm_early_enh[pca_roi_mask]
     enh_threshold = float(np.percentile(enh_vals, config.enhancement_percentile))
 
-    vascular_mask = pca_roi_mask & (norm_early_enh > enh_threshold)
+    peak_ratio = (peak_img - baseline_mean) / np.maximum(baseline_mean, 1e-6)
+    peak_ratio = ndi.gaussian_filter(peak_ratio, sigma=1.0)
+    std_vals = std_img[pca_roi_mask]
+    peak_ratio_vals = peak_ratio[pca_roi_mask]
+    std_threshold = float(np.percentile(std_vals, config.std_percentile)) if std_vals.size > 0 else 0.0
+    peak_ratio_threshold = (
+        float(np.percentile(peak_ratio_vals, config.peak_ratio_percentile)) if peak_ratio_vals.size > 0 else 0.0
+    )
+
+    vascular_mask = (
+        pca_roi_mask
+        & (norm_early_enh > enh_threshold)
+        & (std_img >= std_threshold)
+        & (peak_ratio >= peak_ratio_threshold)
+    )
+    if not np.any(vascular_mask):
+        vascular_mask = pca_roi_mask & (norm_early_enh > enh_threshold)
+    pre_cleanup_vascular_mask = vascular_mask.copy()
     vascular_mask = ndi.binary_opening(vascular_mask, iterations=config.cleanup_open_iters)
     vascular_mask = ndi.binary_closing(vascular_mask, iterations=config.cleanup_close_iters)
 
@@ -83,6 +103,7 @@ def _segment_enhancement_series(img_init, config: SegmentationConfig | None = No
         brain_core_mask=brain_core_mask.astype(bool),
         brain_ring_mask=brain_ring_mask.astype(bool),
         pca_roi_mask=pca_roi_mask.astype(bool),
+        pre_cleanup_vascular_mask=pre_cleanup_vascular_mask.astype(bool),
         vascular_mask=vascular_mask.astype(bool),
         tissue_mask=tissue_mask.astype(bool),
         brain_mask_threshold=brain_threshold,
@@ -137,6 +158,7 @@ def _segment_dynamic_series(img_dyn, config: SegmentationConfig | None = None) -
         brain_core_mask=None,
         brain_ring_mask=None,
         pca_roi_mask=None,
+        pre_cleanup_vascular_mask=None,
         vascular_mask=vascular_mask.astype(bool),
         tissue_mask=tissue_mask.astype(bool),
         brain_mask_threshold=brain_threshold,

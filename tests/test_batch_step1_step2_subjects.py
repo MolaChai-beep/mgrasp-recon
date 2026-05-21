@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -24,8 +25,11 @@ def install_stubs():
         numpy_stub.asarray = lambda value, dtype=None: value
         numpy_stub.arange = lambda *args, **kwargs: []
         numpy_stub.float32 = float
+        numpy_stub.int32 = int
         numpy_stub.complex64 = complex
         numpy_stub.max = max
+        numpy_stub.concatenate = lambda arrays, axis=0: arrays[0] if arrays else []
+        numpy_stub.asarray = lambda value, dtype=None: value
         sys.modules["numpy"] = numpy_stub
 
     if "matplotlib" not in sys.modules:
@@ -166,12 +170,12 @@ class BatchCombinedTests(unittest.TestCase):
 
         combined_spf, stats = self.common.choose_combined_spokes_per_frame(infos)
 
-        self.assertEqual(combined_spf, 16)
+        self.assertEqual(combined_spf, 21)
         stats_map = {item.hop_id: item for item in stats}
-        self.assertEqual(stats_map["DCE"].num_frames, 138)
-        self.assertEqual(stats_map["DCE"].dropped_spokes, 12)
-        self.assertEqual(stats_map["FA2"].num_frames, 8)
-        self.assertEqual(stats_map["FA2"].dropped_spokes, 0)
+        self.assertEqual(stats_map["DCE"].num_frames, 105)
+        self.assertEqual(stats_map["DCE"].dropped_spokes, 15)
+        self.assertEqual(stats_map["FA2"].num_frames, 6)
+        self.assertEqual(stats_map["FA2"].dropped_spokes, 2)
 
     def test_choose_combined_spf_raises_when_no_candidate_survives(self):
         infos = [
@@ -182,16 +186,16 @@ class BatchCombinedTests(unittest.TestCase):
             self.make_info("FA13P", 1, 40),
         ]
 
-        with self.assertRaisesRegex(ValueError, "No valid combined_spokes_per_frame candidate found"):
+        with self.assertRaisesRegex(ValueError, "Fixed combined_spokes_per_frame is invalid for this subject"):
             self.common.choose_combined_spokes_per_frame(infos)
 
     def test_compute_rebin_stats_reports_used_and_dropped_spokes(self):
-        stats = self.common.compute_rebin_stats("DCE", original_spf=23, n_spokes=2220, target_spf=16)
+        stats = self.common.compute_rebin_stats("DCE", original_spf=23, n_spokes=2220, target_spf=21)
 
-        self.assertEqual(stats.num_frames, 138)
-        self.assertEqual(stats.used_spokes, 2208)
-        self.assertEqual(stats.dropped_spokes, 12)
-        self.assertAlmostEqual(stats.dropped_ratio, 12 / 2220)
+        self.assertEqual(stats.num_frames, 105)
+        self.assertEqual(stats.used_spokes, 2205)
+        self.assertEqual(stats.dropped_spokes, 15)
+        self.assertAlmostEqual(stats.dropped_ratio, 15 / 2220)
 
     def test_require_series_configs_reports_missing_dce(self):
         configs = [{"hop_id": "FA2", "spokes_per_frame": 1}]
@@ -233,6 +237,61 @@ class BatchCombinedTests(unittest.TestCase):
         ]
         combined_hop_id = self.common.build_combined_hop_id(infos)
         self.assertEqual(combined_hop_id, "combined_FA2_FA_15_DCE_FA2p_FA13P")
+
+    def test_select_step1_series_info_defaults_to_dce(self):
+        infos = [
+            self.make_info("FA2", 1, 128),
+            self.make_info("DCE", 23, 2220),
+            self.make_info("FA15", 1, 128),
+        ]
+        selected = self.common.select_step1_series_info(infos)
+        self.assertEqual(selected.hop_id, "DCE")
+
+    def test_select_step1_series_info_accepts_override(self):
+        infos = [
+            self.make_info("FA2", 1, 128),
+            self.make_info("DCE", 23, 2220),
+            self.make_info("FA15", 1, 128),
+        ]
+        selected = self.common.select_step1_series_info(infos, step1_hop_id="FA15")
+        self.assertEqual(selected.hop_id, "FA15")
+
+    def test_select_step1_series_info_raises_for_missing_override(self):
+        infos = [
+            self.make_info("FA2", 1, 128),
+            self.make_info("DCE", 23, 2220),
+        ]
+        with self.assertRaisesRegex(ValueError, "step1 hop_id 'MRA' not found"):
+            self.common.select_step1_series_info(infos, step1_hop_id="MRA")
+
+    def test_common_parser_accepts_step1_hop_id(self):
+        parser = self.common.build_common_arg_parser("x")
+        parsed = parser.parse_args(["--csv-dir", "tmp"])
+        self.assertEqual(parsed.step1_hop_id, "DCE")
+
+        parsed_override = parser.parse_args(["--csv-dir", "tmp", "--step1-hop-id", "FA15"])
+        self.assertEqual(parsed_override.step1_hop_id, "FA15")
+
+    def test_step1_run_passes_step1_hop_id_to_common_runner(self):
+        args = types.SimpleNamespace(
+            csv_dir=Path("tmp"),
+            subjects=None,
+            data_root=Path("data"),
+            output_root=Path("out"),
+            coil_thresh=0.02,
+            step1_hop_id="FA15",
+        )
+        with mock.patch.object(self.step1, "load_csv_paths", return_value=[Path("subj01_config.csv")]), \
+             mock.patch.object(self.step1, "get_recon_device", return_value="cpu"), \
+             mock.patch.object(self.step1, "print_device_summary"), \
+             mock.patch.object(self.step1, "subject_id_from_csv", return_value="subj01"), \
+             mock.patch.object(self.step1, "get_subject_log_path", return_value=Path("subj01.log")), \
+             mock.patch.object(self.step1, "tee_subject_log", side_effect=lambda _path: self.common.contextlib.nullcontext()), \
+             mock.patch.object(self.step1, "run_step1_subject") as run_step1_subject:
+            exit_code = self.step1.run(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_step1_subject.call_args.kwargs["step1_hop_id"], "FA15")
 
     def test_all_entrypoints_accept_subjects_arg(self):
         for module in (self.step1, self.step2, self.batch):

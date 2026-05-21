@@ -40,6 +40,7 @@ def run(args) -> int:
                         output_root=args.output_root,
                         coil_thresh=args.coil_thresh,
                         recon_device=recon_device,
+                        step1_hop_id=args.step1_hop_id,
                     )
             except Exception as exc:  # noqa: BLE001
                 if is_oom_error(exc):
